@@ -1,0 +1,6 @@
+opencv-python
+easyocr
+rapidfuzz
+# Phase 2 (audio fallback) — not yet used:
+openai-whisper
+ffmpeg-python
