@@ -1,18 +1,18 @@
-"""Subtitle Timer & Extractor — CLI entry point.
+"""Subtitle Timer — CLI entry point.
 
-Extract subtitles (text + timing) from a video and write a standard .srt.
+Detect WHEN burned-in subtitles are on screen and write a timed .srt with
+placeholder text. There is no text recognition: the point is accurate timing
+for a specific subtitle style, detected either by a simple built-in heuristic
+or by a user-trained ML model (see TRAINING.md).
 
-Two methods:
-  * Visual OCR  — reads burned-in/hardcoded subtitles from video frames.
-  * Audio       — transcribes the audio track with OpenAI Whisper.
-
-In `auto` mode (default), OCR runs first; if it finds fewer than
---min-subtitles blocks, the program falls back to Whisper automatically.
+Pipeline:
+    sample frames -> crop the subtitle box -> detector says yes/no per frame
+    -> group consecutive detections into blocks -> write .srt
 
 Usage:
     python main.py --input video.mp4
-    python main.py --input video.mp4 --mode auto --whisper-model base
-    python main.py --input video.mp4 --mode audio --whisper-model small
+    python main.py --input video.mp4 --crop 0.1 0.8 0.8 0.15 --fps 5
+    python main.py --input video.mp4 --model subtitle_detector.onnx
 """
 
 import argparse
@@ -20,17 +20,25 @@ import os
 import sys
 
 from detector.frame_sampler import sample_frames
-from detector.subtitle_region import crop_region
-from detector.ocr_reader import OCRReader
-from utils.deduplicator import deduplicate
+from detector.subtitle_region import DEFAULT_CROP, crop_rect
+from detector.presence import load_detector
+from utils.grouping import group_detections
 from output.srt_writer import write_srt
-from audio import whisper_transcriber
+
+
+class PipelineCancelled(Exception):
+    """Raised to abort a run mid-pipeline (used by the GUI's Cancel button)."""
+
+
+def _check_cancel(should_cancel):
+    if should_cancel is not None and should_cancel():
+        raise PipelineCancelled()
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        prog="subtitle-extractor",
-        description="Extract subtitles from a video into an .srt file.",
+        prog="subtitle-timer",
+        description="Detect burned-in subtitle timing and write an .srt file.",
     )
     parser.add_argument(
         "--input",
@@ -45,49 +53,49 @@ def parse_args(argv=None):
     parser.add_argument(
         "--fps",
         type=float,
-        default=2.0,
-        help="Frame sampling rate in frames per second for OCR (default: 2).",
+        default=5.0,
+        help="Frame sampling rate; higher = tighter timing, slower (default: 5).",
     )
     parser.add_argument(
-        "--region",
+        "--crop",
         type=float,
-        default=0.25,
-        help="Bottom crop fraction where subtitles live, for OCR (default: 0.25).",
+        nargs=4,
+        metavar=("X", "Y", "W", "H"),
+        default=list(DEFAULT_CROP),
+        help="Subtitle box as fractions of the frame (default: 0 0.75 1 0.25, "
+             "the full-width bottom quarter).",
     )
     parser.add_argument(
-        "--mode",
-        choices=["auto", "ocr", "audio"],
-        default="auto",
-        help="auto: OCR then Whisper fallback; ocr: OCR only; audio: Whisper only.",
+        "--model",
+        default=None,
+        help="Path to a trained .onnx presence model (default: use the "
+             "built-in edge-density heuristic).",
     )
     parser.add_argument(
-        "--whisper-model",
-        choices=["tiny", "base", "small", "medium"],
-        default="base",
-        help="Whisper model size (default: base).",
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Detection threshold 0-1; lower catches more, with more false "
+             "positives (default: 0.5).",
     )
     parser.add_argument(
-        "--min-subtitles",
+        "--gap-tolerance",
         type=int,
-        default=5,
-        help="Min OCR blocks before falling back to Whisper in auto mode (default: 5).",
+        default=1,
+        help="Missed samples allowed inside one block before it splits "
+             "(default: 1).",
     )
     parser.add_argument(
-        "--languages",
-        nargs="+",
-        default=["en"],
-        help="Language codes for OCR (default: en).",
+        "--min-count",
+        type=int,
+        default=2,
+        help="Minimum detections for a block to be kept; filters one-frame "
+             "false positives (default: 2).",
     )
     parser.add_argument(
-        "--similarity",
-        type=float,
-        default=85.0,
-        help="Fuzzy match threshold (0-100) for merging OCR frames (default: 85).",
-    )
-    parser.add_argument(
-        "--gpu",
-        action="store_true",
-        help="Use GPU for OCR if available.",
+        "--text",
+        default="...",
+        help="Placeholder text written into each block (default: '...').",
     )
     return parser.parse_args(argv)
 
@@ -97,51 +105,38 @@ def default_output_path(input_path):
     return base + ".srt"
 
 
-def run_ocr(args):
-    """Run the visual OCR pipeline and return a list of SubtitleBlock."""
-    print(f"Loading OCR engine (languages={args.languages}, gpu={args.gpu})...")
-    reader = OCRReader(languages=args.languages, gpu=args.gpu)
+def run_detection(args, should_cancel=None):
+    """Run presence detection and return a list of SubtitleBlock.
 
-    print(f"Sampling frames from {args.input} at {args.fps} fps...")
-    observations = []
+    `should_cancel` is an optional zero-arg callable; when it returns True
+    the run aborts with PipelineCancelled (checked once per sampled frame).
+    """
+    detector = load_detector(args.model, threshold=args.threshold)
+    engine = "trained model" if args.model else "built-in heuristic"
+    print(f"Detector: {engine} (threshold={args.threshold})")
+    print(f"Sampling {args.input} at {args.fps} fps, crop={tuple(args.crop)}...")
+
+    detections = []
+    visible = False
     for timestamp, frame in sample_frames(args.input, fps=args.fps):
-        cropped = crop_region(frame, region=args.region)
-        text = reader.read(cropped)
-        if text:
-            observations.append((timestamp, text))
-            print(f"  [{timestamp:7.2f}s] {text}")
+        _check_cancel(should_cancel)
+        cropped = crop_rect(frame, args.crop)
+        found = detector.detect(cropped)
+        if found:
+            detections.append(timestamp)
+        if found != visible:
+            visible = found
+            state = "appeared" if found else "gone"
+            print(f"  [{timestamp:7.2f}s] subtitle {state}")
 
-    print(f"Collected {len(observations)} text observations. Deduplicating...")
-    return deduplicate(observations, similarity_threshold=args.similarity, fps=args.fps)
-
-
-def run_audio(args):
-    """Run the Whisper audio transcription and return a list of SubtitleBlock."""
-    print(f"Transcribing audio with Whisper (model={args.whisper_model})...")
-    blocks = whisper_transcriber.transcribe(args.input, model_name=args.whisper_model)
-    print(f"Whisper produced {len(blocks)} subtitle blocks.")
-    return blocks
-
-
-def select_blocks(args):
-    """Pick a method based on --mode and return the subtitle blocks to write."""
-    if args.mode == "ocr":
-        return run_ocr(args)
-
-    if args.mode == "audio":
-        return run_audio(args)
-
-    # auto: OCR first, fall back to Whisper if it found too little.
-    blocks = run_ocr(args)
-    if len(blocks) >= args.min_subtitles:
-        print(f"OCR found {len(blocks)} blocks (>= {args.min_subtitles}). Using OCR.")
-        return blocks
-
-    print(
-        f"OCR found only {len(blocks)} block(s) (< {args.min_subtitles}). "
-        "Falling back to Whisper audio transcription."
+    print(f"{len(detections)} positive frames. Grouping into blocks...")
+    return group_detections(
+        detections,
+        fps=args.fps,
+        gap_tolerance=args.gap_tolerance,
+        min_count=args.min_count,
+        text=args.text,
     )
-    return run_audio(args)
 
 
 def main(argv=None):
@@ -150,10 +145,13 @@ def main(argv=None):
     if not os.path.isfile(args.input):
         print(f"Error: input file not found: {args.input}", file=sys.stderr)
         return 1
+    if args.model and not os.path.isfile(args.model):
+        print(f"Error: model file not found: {args.model}", file=sys.stderr)
+        return 1
 
     output_path = args.output or default_output_path(args.input)
 
-    blocks = select_blocks(args)
+    blocks = run_detection(args)
 
     print(f"Writing {len(blocks)} subtitle blocks to {output_path}...")
     write_srt(blocks, output_path)

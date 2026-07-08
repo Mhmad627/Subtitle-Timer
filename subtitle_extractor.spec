@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec for the Subtitle Timer GUI.
 
-Builds a windowed (no console) onedir app. The heavy ML libraries ship data
-files and dynamically-imported submodules that PyInstaller can't find on its
-own, so we pull them in explicitly with collect_all.
+Builds a windowed (no console) onedir app. Only OpenCV (+ numpy) is bundled:
+the trained detection model runs through cv2.dnn, so no PyTorch or other ML
+frameworks are needed at runtime.
 
 Build:   pyinstaller subtitle_extractor.spec
 Result:  dist/SubtitleExtractor/SubtitleExtractor.exe
@@ -11,23 +11,7 @@ Result:  dist/SubtitleExtractor/SubtitleExtractor.exe
 
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
-binaries = []
-hiddenimports = []
-
-# Packages that need their data files / dynamic submodules collected.
-for pkg in ("whisper", "easyocr", "rapidfuzz", "cv2", "skimage"):
-    d, b, h = collect_all(pkg)
-    datas += d
-    binaries += b
-    hiddenimports += h
-
-# torch is huge; collect_submodules keeps it importable without grabbing
-# everything twice. (collect_all on torch can blow up build time.)
-from PyInstaller.utils.hooks import collect_submodules
-hiddenimports += collect_submodules("torch")
-hiddenimports += collect_submodules("torchvision")
-
+datas, binaries, hiddenimports = collect_all("cv2")
 
 block_cipher = None
 
@@ -40,7 +24,12 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['matplotlib', 'PyQt5', 'PySide2'],
+    # Heavy packages that must never sneak back into the bundle.
+    excludes=[
+        'matplotlib', 'PyQt5', 'PySide2',
+        'torch', 'torchvision', 'easyocr', 'whisper', 'rapidfuzz', 'skimage',
+        'scipy', 'PIL',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

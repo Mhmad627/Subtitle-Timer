@@ -1,0 +1,5 @@
+# Training only — the app itself never needs these (inference is cv2.dnn).
+torch
+onnx
+onnxscript  # required by torch.onnx.export on recent torch versions
+# opencv-python and numpy come from the app's requirements.txt

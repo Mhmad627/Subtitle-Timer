@@ -1,25 +1,41 @@
-"""Locate / crop the region of a frame where subtitles usually appear.
+"""Crop the user-chosen subtitle region out of a frame.
 
-Phase 1 uses a simple heuristic: subtitles are burned into the bottom strip
-of the frame. The crop fraction is configurable. Later phases can replace
-`crop_region` with actual text-region detection (e.g. MSER/EAST).
+The region is a rectangle expressed as fractions of the frame size
+(x, y, w, h), so the same crop works at any video resolution. The GUI lets
+the user drag/resize this box on a preview; the CLI takes it as --crop.
 """
 
+# Bottom quarter, full width — a sensible starting box for most subtitles.
+DEFAULT_CROP = (0.0, 0.75, 1.0, 0.25)
 
-def crop_region(frame, region=0.25):
-    """Return the bottom `region` fraction of the frame.
+
+def clamp_rect(rect):
+    """Clamp an (x, y, w, h) fraction rect to a valid region inside the frame."""
+    x, y, w, h = rect
+    x = min(max(x, 0.0), 0.99)
+    y = min(max(y, 0.0), 0.99)
+    w = min(max(w, 0.01), 1.0 - x)
+    h = min(max(h, 0.01), 1.0 - y)
+    return (x, y, w, h)
+
+
+def crop_rect(frame, rect=DEFAULT_CROP):
+    """Return the part of `frame` covered by the fraction rect (x, y, w, h).
 
     Args:
         frame: BGR numpy array (H x W x C).
-        region: Fraction of the frame height to keep, measured from the
-            bottom. 0.25 keeps the bottom 25%. Clamped to (0, 1].
+        rect: (x, y, w, h) as fractions of frame width/height, e.g.
+            (0.0, 0.75, 1.0, 0.25) is the full-width bottom quarter.
 
     Returns:
-        A view of the cropped frame (bottom strip).
+        A view of the cropped frame (at least 1x1 pixels).
     """
-    if region <= 0 or region > 1:
-        region = 0.25
+    x, y, w, h = clamp_rect(rect)
+    height, width = frame.shape[:2]
 
-    height = frame.shape[0]
-    start_row = int(height * (1.0 - region))
-    return frame[start_row:height, :]
+    x0 = int(width * x)
+    y0 = int(height * y)
+    x1 = max(x0 + 1, int(width * (x + w)))
+    y1 = max(y0 + 1, int(height * (y + h)))
+
+    return frame[y0:y1, x0:x1]

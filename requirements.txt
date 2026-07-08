@@ -1,6 +1,5 @@
+# App runtime (the trained model runs via cv2.dnn — no ML framework needed)
 opencv-python
-easyocr
-rapidfuzz
-# Phase 2 (audio fallback) — not yet used:
-openai-whisper
-ffmpeg-python
+numpy
+
+# Training has its own requirements: see training/requirements.txt

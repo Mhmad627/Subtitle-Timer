@@ -20,6 +20,12 @@ build.log
 # Generated subtitle output
 *.srt
 
+# Training data (dumped frames sorted into yes/no)
+dataset/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
+
+# Local Claude instructions
+CLAUDE.md
