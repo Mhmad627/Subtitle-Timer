@@ -66,7 +66,9 @@ class OnnxDetector:
 
     def __init__(self, model_path, threshold=0.5):
         self.threshold = threshold
-        self._net = cv2.dnn.readNetFromONNX(model_path)
+        # Load via an in-memory buffer: readNetFromONNX(path) can't open
+        # non-ASCII paths on Windows, np.fromfile can.
+        self._net = cv2.dnn.readNetFromONNX(np.fromfile(model_path, dtype=np.uint8))
 
     def classify(self, image):
         blob = cv2.dnn.blobFromImage(

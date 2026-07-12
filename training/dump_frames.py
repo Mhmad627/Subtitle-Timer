@@ -52,7 +52,15 @@ def main(argv=None):
         for timestamp, frame in sample_frames(video, fps=args.fps):
             crop = crop_rect(frame, args.crop)
             name = f"{stem}_{int(timestamp * 1000):08d}ms.png"
-            cv2.imwrite(os.path.join(args.out, name), crop)
+            # cv2.imwrite silently fails on non-ASCII filenames on Windows
+            # (Japanese video names!); encode in memory and write with
+            # Python's open(), which handles Unicode paths properly.
+            ok, buffer = cv2.imencode(".png", crop)
+            if not ok:
+                print(f"  failed to encode frame at {timestamp:.1f}s")
+                continue
+            with open(os.path.join(args.out, name), "wb") as f:
+                f.write(buffer.tobytes())
             count += 1
         print(f"{video}: {count} crops")
         total += count

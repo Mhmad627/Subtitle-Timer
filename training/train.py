@@ -75,7 +75,10 @@ def load_folder(folder, class_index):
     images, labels = [], []
     for name in sorted(os.listdir(folder)):
         path = os.path.join(folder, name)
-        img = cv2.imread(path)
+        # cv2.imread can't open non-ASCII filenames on Windows (Japanese
+        # video names); read the bytes with numpy and decode in memory.
+        data = np.fromfile(path, dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
         if img is None:
             print(f"  skipping unreadable file: {path}")
             continue
