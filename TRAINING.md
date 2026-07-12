@@ -22,11 +22,13 @@ position you use in the app):
 
 ```bash
 python training/dump_frames.py --input video1.mp4 video2.mp4 video3.mp4
-# custom box / rate:
+# custom box, or a sparse 1-per-second dump instead of every frame:
 python training/dump_frames.py --input video.mp4 --crop 0.1 0.8 0.8 0.15 --fps 1
 ```
 
-Images land in `dataset/unsorted/`.
+Images land in `dataset/unsorted/`. By default every native frame is
+dumped (a 100 s short at 30 fps = ~3000 crops), which captures brief lines
+and rare style variants — sort selectively and delete the rest.
 
 ## 2. Sort them (the actual "labeling")
 

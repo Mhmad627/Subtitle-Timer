@@ -7,6 +7,7 @@ dataset/no/ (no subtitle), dataset/N/ (normal subtitle) and dataset/S/
 
 Usage:
     python training/dump_frames.py --input video1.mp4 video2.mp4
+    # custom box, or a sparse 1-per-second dump instead of every frame:
     python training/dump_frames.py --input video.mp4 --crop 0.1 0.8 0.8 0.15 --fps 1
 """
 
@@ -31,8 +32,9 @@ def parse_args(argv=None):
                         default=list(DEFAULT_CROP),
                         help="Subtitle box as frame fractions — use roughly the "
                              "same box you position in the app.")
-    parser.add_argument("--fps", type=float, default=1.0,
-                        help="Frames per second to dump (default: 1).")
+    parser.add_argument("--fps", type=float, default=0.0,
+                        help="Frames per second to dump; 0 = every native "
+                             "frame (default). Use e.g. 1 for a sparse dump.")
     parser.add_argument("--out", default=os.path.join("dataset", "unsorted"),
                         help="Output folder (default: dataset/unsorted).")
     return parser.parse_args(argv)
