@@ -73,10 +73,12 @@ Video file
   → Write .srt                               output/srt_writer.py
 ```
 
-Back-to-back subtitles (a new sentence replacing the previous one with no
+Back-to-back N subtitles (a new sentence replacing the previous one with no
 gap) are separated by comparing bright-pixel masks between consecutive
 frames: the glyph pattern of an unchanged subtitle is pixel-stable even
 while the video moves behind it, so a mask-overlap drop means new text.
+S runs are never split this way (their bright banner hides text changes
+from the mask); an S block ends on a class change or a gap.
 
 ## Project structure
 

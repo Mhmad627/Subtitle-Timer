@@ -149,7 +149,13 @@ def run_detection(args, should_cancel=None):
                 splitter.reset()
         else:
             if splitter is not None:
-                is_new = splitter.update(cropped)
+                if label == "S":
+                    # Text-change splitting applies to N only: the S banner
+                    # is bright with dark text, which the bright-pixel mask
+                    # can't track, so S runs are never split.
+                    splitter.reset()
+                else:
+                    is_new = splitter.update(cropped)
             detections.append((timestamp, label, is_new))
 
         if label != current:

@@ -94,14 +94,15 @@ if you ever need to adjust the positions.
 
 ## Back-to-back subtitles
 
-The model only answers no/N/S per frame; when one sentence instantly
+The model only answers no/N/S per frame; when one N sentence instantly
 replaces another, the boundary between them is found separately by
 [detector/text_change.py](detector/text_change.py): it compares bright-pixel
 masks between consecutive frames and splits the block when the glyph
-pattern changes (`--split-iou`, default 0.5; 0 disables). This assumes the
-subtitle text is bright (white/yellow); if your style is dark or heavily
-colored, tell the splitter via its `brightness` parameter — or splitting
-silently stays off and blocks just merge like before.
+pattern changes (`--split-iou`, default 0.5; 0 disables).
+
+**N only, by design.** S runs are never split this way: the S style is dark
+text on a bright banner, which the bright-pixel mask can't track. An S block
+ends when the class changes or a gap appears.
 
 ## Notes for the CV write-up
 
