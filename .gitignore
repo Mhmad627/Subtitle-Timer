@@ -32,3 +32,6 @@ CLAUDE.md
 
 # Private notes
 NOTES.md
+
+# Trained models (kept local; retrained often)
+*.onnx
