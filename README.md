@@ -80,6 +80,23 @@ while the video moves behind it, so a mask-overlap drop means new text.
 S runs are never split this way (their bright banner hides text changes
 from the mask); an S block ends on a class change or a gap.
 
+## Design decisions
+
+- **Time subtitles, don't read them.** OCR quality on stylized hardsubs was
+  the original approach and proved unreliable; timing + placeholder text
+  slots straight into a subtitle editor (Aegisub), where text entry is fast
+  but manual timing is the tedious part.
+- **Framework-free deployment.** The model is trained in PyTorch but
+  exported to ONNX and executed with OpenCV's `dnn` module, so the shipped
+  app carries no ML framework. The `.onnx` file is swappable without
+  rebuilding the app.
+- **Training and inference share one contract.** Class order and input
+  preprocessing are constants in `detector/presence.py`, imported by the
+  trainer; the export ends with a cv2.dnn-vs-PyTorch parity check.
+- **Classical CV where ML isn't needed.** Zero-gap boundaries between
+  consecutive N subtitles are found by comparing bright-pixel glyph masks
+  across frames — simpler and more predictable than learning it.
+
 ## Project structure
 
 ```

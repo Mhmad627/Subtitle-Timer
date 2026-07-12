@@ -103,11 +103,3 @@ pattern changes (`--split-iou`, default 0.5; 0 disables).
 **N only, by design.** S runs are never split this way: the S style is dark
 text on a bright banner, which the bright-pixel mask can't track. An S block
 ends when the class changes or a gap appears.
-
-## Notes for the CV write-up
-
-Things this project demonstrates that are worth naming: multi-class dataset
-design with hard negatives, augmentation for robustness to box placement,
-train/val methodology, ONNX export, and framework-free deployment (a
-PyTorch-trained model shipped in a ~170 MB app via OpenCV's dnn instead of
-bundling torch).
