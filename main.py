@@ -1,13 +1,15 @@
 """Subtitle Timer — CLI entry point.
 
 Detect WHEN burned-in subtitles are on screen and write a timed .srt with
-placeholder text. There is no text recognition: the point is accurate timing
-for a specific subtitle style, detected either by a simple built-in heuristic
-or by a user-trained ML model (see TRAINING.md).
+placeholder text. There is no text recognition. Frames are classified into
+three classes: "no" (nothing), "N" (normal subtitle -> one timed block), and
+"S" (special style -> three ASS-tagged lines with identical timing). The
+classifier is either a simple built-in heuristic (N only) or a user-trained
+ML model (see TRAINING.md).
 
 Pipeline:
-    sample frames -> crop the subtitle box -> detector says yes/no per frame
-    -> group consecutive detections into blocks -> write .srt
+    sample frames -> crop the subtitle box -> classify no/N/S per frame
+    -> group same-label runs into blocks -> expand S blocks -> write .srt
 
 Usage:
     python main.py --input video.mp4
@@ -22,7 +24,8 @@ import sys
 from detector.frame_sampler import sample_frames
 from detector.subtitle_region import DEFAULT_CROP, crop_rect
 from detector.presence import load_detector
-from utils.grouping import group_detections
+from detector.text_change import TextChangeSplitter
+from utils.grouping import expand_s_blocks, group_detections
 from output.srt_writer import write_srt
 
 
@@ -95,7 +98,16 @@ def parse_args(argv=None):
     parser.add_argument(
         "--text",
         default="...",
-        help="Placeholder text written into each block (default: '...').",
+        help="Placeholder text written into N blocks (default: '...'). "
+             "S blocks get the fixed ASS tag lines instead.",
+    )
+    parser.add_argument(
+        "--split-iou",
+        type=float,
+        default=0.5,
+        help="Split a block when the bright-text mask overlap between "
+             "consecutive frames drops below this IoU — separates "
+             "back-to-back subtitles with no gap (0 disables; default: 0.5).",
     )
     return parser.parse_args(argv)
 
@@ -106,37 +118,59 @@ def default_output_path(input_path):
 
 
 def run_detection(args, should_cancel=None):
-    """Run presence detection and return a list of SubtitleBlock.
+    """Run per-frame classification and return a list of SubtitleBlock.
+
+    N runs become one placeholder block each; S runs are expanded into three
+    ASS-tagged lines with identical timing (utils/grouping.S_LINE_TAGS).
 
     `should_cancel` is an optional zero-arg callable; when it returns True
     the run aborts with PipelineCancelled (checked once per sampled frame).
     """
     detector = load_detector(args.model, threshold=args.threshold)
-    engine = "trained model" if args.model else "built-in heuristic"
+    engine = "trained model" if args.model else "built-in heuristic (all N)"
     print(f"Detector: {engine} (threshold={args.threshold})")
     print(f"Sampling {args.input} at {args.fps} fps, crop={tuple(args.crop)}...")
 
+    splitter = (
+        TextChangeSplitter(iou_threshold=args.split_iou)
+        if args.split_iou > 0 else None
+    )
+
     detections = []
-    visible = False
+    current = "no"
     for timestamp, frame in sample_frames(args.input, fps=args.fps):
         _check_cancel(should_cancel)
         cropped = crop_rect(frame, args.crop)
-        found = detector.detect(cropped)
-        if found:
-            detections.append(timestamp)
-        if found != visible:
-            visible = found
-            state = "appeared" if found else "gone"
+        label, _confidence = detector.classify(cropped)
+
+        is_new = False
+        if label == "no":
+            if splitter is not None:
+                splitter.reset()
+        else:
+            if splitter is not None:
+                is_new = splitter.update(cropped)
+            detections.append((timestamp, label, is_new))
+
+        if label != current:
+            current = label
+            state = "gone" if label == "no" else f"{label} appeared"
             print(f"  [{timestamp:7.2f}s] subtitle {state}")
+        elif is_new:
+            print(f"  [{timestamp:7.2f}s] subtitle changed ({label})")
 
     print(f"{len(detections)} positive frames. Grouping into blocks...")
-    return group_detections(
+    blocks = group_detections(
         detections,
         fps=args.fps,
         gap_tolerance=args.gap_tolerance,
         min_count=args.min_count,
         text=args.text,
     )
+    n_s = sum(1 for b in blocks if b.label == "S")
+    if n_s:
+        print(f"Expanding {n_s} S block(s) into 3 tagged lines each...")
+    return expand_s_blocks(blocks)
 
 
 def main(argv=None):

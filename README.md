@@ -1,15 +1,21 @@
 # Subtitle Timer
 
 Detect **when** burned-in subtitles are on screen and write a timed `.srt`
-with placeholder text. Built for one consistent subtitle style: you position
-a crop box over the subtitle area, a detector answers "subtitle visible?"
-per sampled frame, and runs of positives become timed blocks.
+with placeholder text. You position a crop box over the subtitle area and a
+classifier labels every sampled frame:
 
-Two detectors, one interface:
+- **N** — normal subtitle → one timed block
+- **S** — special stacked style → three lines with identical timing and ASS
+  tags (`{\fad(0,300)\pos(...)}`, positions in `utils/grouping.py`)
+- **no** — nothing → ignored
+
+Runs of same-label frames become blocks ("time it until the sub changes").
+
+Two classifiers, one interface:
 
 - **Built-in heuristic** — edge-density check, works out of the box on
-  high-contrast subs. A stand-in and baseline.
-- **Your trained model** — a small CNN you train on your own videos
+  high-contrast subs (labels everything N). A stand-in and baseline.
+- **Your trained model** — a small 3-class CNN you train on your own videos
   (see [TRAINING.md](TRAINING.md)), exported to ONNX and run through
   OpenCV's `dnn` module. No PyTorch needed at runtime.
 
@@ -51,7 +57,8 @@ python main.py --input video.mp4 --model subtitle_detector.onnx
 | `--threshold`     | `0.5`            | Detection score cutoff (0–1); lower catches more.          |
 | `--gap-tolerance` | `1`              | Missed samples allowed inside one block.                   |
 | `--min-count`     | `2`              | Minimum detections to keep a block (filters one-offs).     |
-| `--text`          | `...`            | Placeholder text written into each block.                  |
+| `--text`          | `...`            | Placeholder text for N blocks (S blocks get ASS tag lines). |
+| `--split-iou`     | `0.5`            | Text-change split sensitivity for back-to-back subs (0 = off). |
 
 ## How it works
 
@@ -59,10 +66,17 @@ python main.py --input video.mp4 --model subtitle_detector.onnx
 Video file
   → Sample frames at N fps (OpenCV)          detector/frame_sampler.py
   → Crop the user-positioned subtitle box    detector/subtitle_region.py
-  → Detector: subtitle visible? yes/no       detector/presence.py
-  → Group positive runs into timed blocks    utils/grouping.py
-  → Write .srt (placeholder text)            output/srt_writer.py
+  → Classify each frame: no / N / S          detector/presence.py
+  → Spot text changes (back-to-back subs)    detector/text_change.py
+  → Group runs into timed blocks             utils/grouping.py
+  → Expand S blocks into 3 tagged lines      utils/grouping.py
+  → Write .srt                               output/srt_writer.py
 ```
+
+Back-to-back subtitles (a new sentence replacing the previous one with no
+gap) are separated by comparing bright-pixel masks between consecutive
+frames: the glyph pattern of an unchanged subtitle is pixel-stable even
+while the video moves behind it, so a mask-overlap drop means new text.
 
 ## Project structure
 
@@ -97,8 +111,9 @@ model is a separate small `.onnx` file you can swap without rebuilding.
 
 ## Roadmap
 
-- [x] Timing pipeline with pluggable presence detector (heuristic baseline)
+- [x] Timing pipeline with pluggable classifier (heuristic baseline)
 - [x] GUI: movable/resizable crop box, scrubber, cancel, live log
-- [x] Training kit: dataset dumper + tiny CNN + ONNX export
+- [x] Training kit: dataset dumper + tiny 3-class CNN (no/N/S) + ONNX export
+- [x] S blocks → three ASS-tagged lines with shared timing
+- [x] Zero-gap boundary splitting (bright-mask IoU between frames)
 - [ ] Train the real model on target videos
-- [ ] Boundary refinement (re-check frames around block edges at full fps)

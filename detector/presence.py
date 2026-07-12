@@ -1,18 +1,29 @@
-"""Frame-level subtitle presence detection.
+"""Frame-level subtitle classification.
 
-The pipeline asks one question per sampled frame: "is a subtitle visible in
-the crop?" Two implementations answer it:
+The pipeline asks one question per sampled frame: "what is visible in the
+crop box?" with three possible answers:
 
-* HeuristicDetector — no ML. An edge-density stand-in so the app works end to
-  end before the model exists, and a baseline for the model to beat.
-* OnnxDetector — the user-trained classifier, run through OpenCV's dnn module
-  so the app needs no PyTorch at runtime.
+* "no" — no subtitle
+* "N"  — a normal subtitle
+* "S"  — the special subtitle style that is written out as three stacked
+         ASS-tagged lines (see utils/grouping.py)
 
-Both expose `score(image) -> float in [0, 1]` and `detect(image) -> bool`.
+Two implementations:
+
+* HeuristicDetector — no ML. Edge-density stand-in so the app works before
+  the model exists. It cannot tell S from N, so everything it finds is "N".
+* OnnxDetector — the user-trained 3-class classifier, run through OpenCV's
+  dnn module so the app needs no PyTorch at runtime.
+
+Both expose `classify(image) -> (label, confidence)`.
 """
 
 import cv2
 import numpy as np
+
+# Class order is the contract between training and inference: the model's
+# softmax output must be in this order, and dataset folders use these names.
+CLASS_NAMES = ("no", "N", "S")
 
 # Input geometry / preprocessing contract for the ONNX model. training/train.py
 # imports these so training and inference can never drift apart:
@@ -25,8 +36,8 @@ class HeuristicDetector:
     """Edge-density placeholder until the trained model exists.
 
     Subtitle text produces a burst of sharp edges inside the crop box; an
-    empty background usually doesn't. Crude — busy scenes fool it — but it
-    keeps the pipeline testable and gives the ML model a baseline.
+    empty background usually doesn't. Crude — busy scenes fool it, and it
+    cannot distinguish the S style, so every detection is labelled "N".
     """
 
     # Edge densities at or above this map to score 1.0. Text in a tight crop
@@ -36,28 +47,28 @@ class HeuristicDetector:
     def __init__(self, threshold=0.5):
         self.threshold = threshold
 
-    def score(self, image):
+    def classify(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 100, 200)
         density = float(np.count_nonzero(edges)) / edges.size
-        return min(1.0, density / self._FULL_SCALE_DENSITY)
-
-    def detect(self, image):
-        return self.score(image) >= self.threshold
+        score = min(1.0, density / self._FULL_SCALE_DENSITY)
+        if score >= self.threshold:
+            return "N", score
+        return "no", 1.0 - score
 
 
 class OnnxDetector:
-    """Runs a trained ONNX presence classifier (see training/train.py).
+    """Runs the trained ONNX classifier (see training/train.py).
 
     The model must take a (1, 3, MODEL_INPUT_H, MODEL_INPUT_W) RGB tensor in
-    [0, 1] and output a single sigmoid probability.
+    [0, 1] and output softmax probabilities in CLASS_NAMES order.
     """
 
     def __init__(self, model_path, threshold=0.5):
         self.threshold = threshold
         self._net = cv2.dnn.readNetFromONNX(model_path)
 
-    def score(self, image):
+    def classify(self, image):
         blob = cv2.dnn.blobFromImage(
             image,
             scalefactor=1.0 / 255.0,
@@ -65,10 +76,14 @@ class OnnxDetector:
             swapRB=True,  # BGR -> RGB
         )
         self._net.setInput(blob)
-        return float(self._net.forward().reshape(-1)[0])
-
-    def detect(self, image):
-        return self.score(image) >= self.threshold
+        probs = self._net.forward().reshape(-1)
+        idx = int(np.argmax(probs))
+        label = CLASS_NAMES[idx]
+        confidence = float(probs[idx])
+        # A hesitant subtitle call is treated as "no subtitle".
+        if label != "no" and confidence < self.threshold:
+            return "no", confidence
+        return label, confidence
 
 
 def load_detector(model_path=None, threshold=0.5):

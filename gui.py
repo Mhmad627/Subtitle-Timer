@@ -2,10 +2,10 @@
 
 Pick a video, drag/resize the green box onto the subtitle area (scrub to a
 moment where a subtitle is visible), and click Detect. The app samples
-frames, asks the detector "is a subtitle visible in the box?" per frame,
-groups the positives into timed blocks, and writes an .srt with placeholder
-text. Until your trained model (.onnx) is selected, a simple edge-density
-heuristic stands in.
+frames, classifies each as no / N / S, groups same-label runs into timed
+blocks (S blocks become three ASS-tagged lines), and writes an .srt. Until
+your trained model (.onnx) is selected, a simple edge-density heuristic
+stands in and labels everything N.
 
 Run directly:   python gui.py
 Or build an exe: pyinstaller subtitle_extractor.spec
@@ -112,19 +112,20 @@ _HELP = {
         "cheap, so 5 is a good default (0.2 s timing precision)."
     ),
     "threshold": (
-        "Detector score cutoff, 0-1. A frame counts as 'subtitle visible' "
-        "when the detector's score is at least this. Lower catches fainter "
+        "Detector confidence cutoff, 0-1. A frame only counts as N or S "
+        "when the detector is at least this confident. Lower catches fainter "
         "subs but risks false positives; higher is stricter."
     ),
     "text": (
-        "Placeholder text written into every .srt block. This tool times "
-        "subtitles, it doesn't read them — fill the text in later with a "
+        "Placeholder text written into N blocks. S blocks instead become "
+        "three lines with identical timing and fixed ASS tags "
+        "(fade + stacked positions). Fill real text in later with a "
         "subtitle editor (e.g. Aegisub)."
     ),
     "model": (
-        "Your trained subtitle-presence model (.onnx, see TRAINING.md). "
-        "Leave blank to use the built-in edge-density heuristic — a crude "
-        "stand-in that works best on high-contrast subs."
+        "Your trained 3-class model (.onnx, see TRAINING.md) that labels "
+        "each frame no / N / S. Leave blank to use the built-in edge-density "
+        "heuristic — a crude stand-in that labels everything it finds as N."
     ),
 }
 
@@ -532,6 +533,7 @@ class SubtitleTimerGUI:
                 gap_tolerance=1,
                 min_count=2,
                 text=self.text_var.get() or "...",
+                split_iou=0.5,
             )
         except ValueError as exc:
             messagebox.showerror("Invalid option", f"Check numeric fields:\n{exc}")

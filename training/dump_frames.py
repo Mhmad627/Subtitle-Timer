@@ -2,8 +2,8 @@
 
 Samples frames the same way the app does, crops the subtitle box, and saves
 each crop as a PNG into dataset/unsorted/. You then sort the images into
-dataset/yes/ (a subtitle is visible) and dataset/no/ (it isn't) — see
-TRAINING.md.
+dataset/no/ (no subtitle), dataset/N/ (normal subtitle) and dataset/S/
+(the special stacked-lines style) — see TRAINING.md.
 
 Usage:
     python training/dump_frames.py --input video1.mp4 video2.mp4
@@ -58,8 +58,8 @@ def main(argv=None):
         total += count
 
     print(f"\nDumped {total} images to {args.out}.")
-    print("Next: sort them into dataset/yes/ and dataset/no/, then run "
-          "training/train.py.")
+    print("Next: sort them into dataset/no/, dataset/N/ and dataset/S/, "
+          "then run training/train.py.")
     return 0
 
 
