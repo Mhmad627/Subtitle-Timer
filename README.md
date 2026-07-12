@@ -51,12 +51,12 @@ python main.py --input video.mp4 --model subtitle_detector.onnx
 | ----------------- | ---------------- | ---------------------------------------------------------- |
 | `--input`         | (required)       | Path to the input video file.                              |
 | `--output`        | `<input>.srt`    | Path to the output `.srt` file.                            |
-| `--fps`           | `5`              | Sampling rate; higher = tighter timing, slower.            |
+| `--fps`           | `0`              | Sampling rate; 0 = every frame (frame-accurate timing).    |
 | `--crop`          | `0 0.75 1 0.25`  | Subtitle box `X Y W H` as fractions of the frame.          |
 | `--model`         | (heuristic)      | Trained `.onnx` presence model.                            |
 | `--threshold`     | `0.5`            | Detection score cutoff (0–1); lower catches more.          |
-| `--gap-tolerance` | `1`              | Missed samples allowed inside one block.                   |
-| `--min-count`     | `2`              | Minimum detections to keep a block (filters one-offs).     |
+| `--max-gap`       | `0.3`            | Longest silence (s) bridged inside one block.              |
+| `--min-duration`  | `0.25`           | Drop blocks shorter than this (s).                         |
 | `--text`          | `...`            | Placeholder text for N blocks (S blocks get ASS tag lines). |
 | `--split-iou`     | `0.5`            | Text-change split sensitivity for back-to-back subs (0 = off). |
 
@@ -74,11 +74,13 @@ Video file
 ```
 
 Back-to-back N subtitles (a new sentence replacing the previous one with no
-gap) are separated by comparing bright-pixel masks between consecutive
-frames: the glyph pattern of an unchanged subtitle is pixel-stable even
+gap) are separated by comparing glyph masks between consecutive frames.
+The mask is *bright pixels near saturated pixels* — the white glyph core
+hugging its colored border — which excludes bright scene backgrounds that
+would otherwise hide the change. An unchanged subtitle is pixel-stable even
 while the video moves behind it, so a mask-overlap drop means new text.
-S runs are never split this way (their bright banner hides text changes
-from the mask); an S block ends on a class change or a gap.
+S runs are never split this way (their bright banner hides text changes);
+an S block ends on a class change or a gap.
 
 ## Design decisions
 

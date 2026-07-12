@@ -38,7 +38,7 @@ class SubtitleBlock:
         )
 
 
-def group_detections(detections, fps, gap_tolerance=1, min_count=2, text="..."):
+def group_detections(detections, fps, max_gap=0.3, min_duration=0.25, text="..."):
     """Group labelled detections into timed subtitle blocks.
 
     Args:
@@ -47,11 +47,12 @@ def group_detections(detections, fps, gap_tolerance=1, min_count=2, text="..."):
             "no"). is_new=True marks a frame whose text differs from the
             previous positive frame, forcing a block boundary there.
         fps: The sampling rate the timestamps came from.
-        gap_tolerance: How many consecutive missed samples are allowed inside
-            one block. Bridges single-frame detector flickers without gluing
-            two different subtitles together.
-        min_count: Minimum number of detections for a block to be kept.
-            Filters out isolated false positives.
+        max_gap: Longest silence (seconds) bridged inside one block. Covers
+            detector flicker during fades/animations; the text-change
+            splitter still separates different subtitles inside a bridged
+            gap. Always at least one sample interval.
+        min_duration: Blocks shorter than this (seconds) are dropped —
+            isolated false positives, not real subtitles.
         text: Placeholder text written into every block (this tool times
             subtitles, it doesn't read them).
 
@@ -62,28 +63,24 @@ def group_detections(detections, fps, gap_tolerance=1, min_count=2, text="..."):
         return []
 
     interval = 1.0 / fps
-    # Two detections continue the same block if the gap between them is at
-    # most (gap_tolerance + 1) sample intervals (with a little float slack).
-    max_gap = (gap_tolerance + 1) * interval + 1e-6
+    bridge = max(max_gap, interval) + 1e-6
 
     blocks = []
     start, prev = detections[0][0], detections[0][0]
     label = detections[0][1]
-    count = 1
 
     def flush():
-        if count >= min_count:
-            blocks.append(SubtitleBlock(start, prev + interval, text, label=label))
+        end = prev + interval
+        if end - start >= min_duration:
+            blocks.append(SubtitleBlock(start, end, text, label=label))
 
     for t, lab, is_new in detections[1:]:
-        if lab == label and t - prev <= max_gap and not is_new:
+        if lab == label and t - prev <= bridge and not is_new:
             prev = t
-            count += 1
         else:
             flush()
             start = prev = t
             label = lab
-            count = 1
 
     flush()
     return blocks

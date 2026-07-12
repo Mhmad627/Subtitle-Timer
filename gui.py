@@ -107,9 +107,10 @@ class _Tooltip:
 
 _HELP = {
     "fps": (
-        "How many frames per second are checked for a subtitle. Higher gives "
-        "tighter start/end timing but is proportionally slower. Detection is "
-        "cheap, so 5 is a good default (0.2 s timing precision)."
+        "How many frames per second are checked for a subtitle. 0 = every "
+        "frame in the video: frame-accurate timing, recommended (a 2-minute "
+        "short takes on the order of a minute). A rate like 5 is faster for "
+        "rough passes but times only to the nearest 0.2 s."
     ),
     "threshold": (
         "Detector confidence cutoff, 0-1. A frame only counts as N or S "
@@ -234,7 +235,7 @@ class SubtitleTimerGUI:
         opt.pack(fill="x", **pad)
 
         ttk.Label(opt, text="Sample fps:").grid(row=0, column=0, sticky="e", padx=6, pady=4)
-        self.fps_var = tk.StringVar(value="5")
+        self.fps_var = tk.StringVar(value="0")
         ttk.Entry(opt, textvariable=self.fps_var, width=8).grid(
             row=0, column=1, sticky="w", padx=6, pady=4
         )
@@ -530,8 +531,8 @@ class SubtitleTimerGUI:
                 crop=tuple(self._crop),
                 model=model_path,
                 threshold=float(self.threshold_var.get()),
-                gap_tolerance=1,
-                min_count=2,
+                max_gap=0.3,
+                min_duration=0.25,
                 text=self.text_var.get() or "...",
                 split_iou=0.5,
             )

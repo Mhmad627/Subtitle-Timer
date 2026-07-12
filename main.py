@@ -56,8 +56,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--fps",
         type=float,
-        default=5.0,
-        help="Frame sampling rate; higher = tighter timing, slower (default: 5).",
+        default=0.0,
+        help="Frame sampling rate. 0 = every frame, frame-accurate timing "
+             "(default). A rate like 5 is faster but times only to ±1/rate s.",
     )
     parser.add_argument(
         "--crop",
@@ -82,18 +83,18 @@ def parse_args(argv=None):
              "positives (default: 0.5).",
     )
     parser.add_argument(
-        "--gap-tolerance",
-        type=int,
-        default=1,
-        help="Missed samples allowed inside one block before it splits "
-             "(default: 1).",
+        "--max-gap",
+        type=float,
+        default=0.3,
+        help="Longest silence in seconds bridged inside one block; covers "
+             "detector flicker during fades (default: 0.3).",
     )
     parser.add_argument(
-        "--min-count",
-        type=int,
-        default=2,
-        help="Minimum detections for a block to be kept; filters one-frame "
-             "false positives (default: 2).",
+        "--min-duration",
+        type=float,
+        default=0.25,
+        help="Drop blocks shorter than this many seconds — isolated false "
+             "positives (default: 0.25).",
     )
     parser.add_argument(
         "--text",
@@ -128,8 +129,9 @@ def run_detection(args, should_cancel=None):
     """
     detector = load_detector(args.model, threshold=args.threshold)
     engine = "trained model" if args.model else "built-in heuristic (all N)"
+    rate = "every frame" if args.fps <= 0 else f"{args.fps} fps"
     print(f"Detector: {engine} (threshold={args.threshold})")
-    print(f"Sampling {args.input} at {args.fps} fps, crop={tuple(args.crop)}...")
+    print(f"Sampling {args.input} at {rate}, crop={tuple(args.crop)}...")
 
     splitter = (
         TextChangeSplitter(iou_threshold=args.split_iou)
@@ -138,21 +140,27 @@ def run_detection(args, should_cancel=None):
 
     detections = []
     current = "no"
+    # The real sampling interval is measured from the first two timestamps
+    # (fps=0 means native rate, which only the video itself knows).
+    first_ts = second_ts = None
     for timestamp, frame in sample_frames(args.input, fps=args.fps):
         _check_cancel(should_cancel)
+        if first_ts is None:
+            first_ts = timestamp
+        elif second_ts is None:
+            second_ts = timestamp
         cropped = crop_rect(frame, args.crop)
         label, _confidence = detector.classify(cropped)
 
         is_new = False
-        if label == "no":
-            if splitter is not None:
-                splitter.reset()
-        else:
+        if label != "no":
+            # The splitter keeps its memory across "no" flickers so a text
+            # change can't hide inside a gap that grouping later bridges.
             if splitter is not None:
                 if label == "S":
                     # Text-change splitting applies to N only: the S banner
-                    # is bright with dark text, which the bright-pixel mask
-                    # can't track, so S runs are never split.
+                    # is bright with dark text, which the glyph mask can't
+                    # track, so S runs are never split.
                     splitter.reset()
                 else:
                     is_new = splitter.update(cropped)
@@ -165,12 +173,16 @@ def run_detection(args, should_cancel=None):
         elif is_new:
             print(f"  [{timestamp:7.2f}s] subtitle changed ({label})")
 
+    effective_fps = args.fps
+    if second_ts is not None and second_ts > first_ts:
+        effective_fps = 1.0 / (second_ts - first_ts)
+
     print(f"{len(detections)} positive frames. Grouping into blocks...")
     blocks = group_detections(
         detections,
-        fps=args.fps,
-        gap_tolerance=args.gap_tolerance,
-        min_count=args.min_count,
+        fps=effective_fps,
+        max_gap=args.max_gap,
+        min_duration=args.min_duration,
         text=args.text,
     )
     n_s = sum(1 for b in blocks if b.label == "S")

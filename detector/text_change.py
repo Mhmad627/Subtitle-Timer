@@ -2,15 +2,20 @@
 
 Presence classification alone can't separate two subtitles shown
 back-to-back with no gap (a speaker's next sentence replacing the previous
-one instantly). This module sees that boundary: subtitle glyphs are bright,
-pixel-stable shapes, so we threshold the crop to a bright-pixel mask and
-compare consecutive masks. While one subtitle stays on screen the mask
-barely moves (even if the video behind it does); when the text changes, the
-glyph pattern — and therefore the mask — changes a lot.
+one instantly). This module sees that boundary by masking the glyph pixels
+each frame and comparing consecutive masks: while one subtitle stays on
+screen its glyphs are pixel-stable even though the video moves behind them;
+when the text changes, the mask changes a lot.
 
-Graceful degradation: if the subtitle style isn't bright enough to mask
-(fewer than `min_pixels` bright pixels), comparison is skipped and blocks
-simply aren't split — the pre-splitter behaviour.
+A plain brightness threshold is NOT enough for a glyph mask — bright scene
+backgrounds (white walls, skin) dominate it and hide text changes. The N
+style is a white core wrapped in a thick saturated border, so the mask is:
+bright pixels NEAR saturated pixels. Background whites have no saturated
+border around them and drop out. Measured on real crops, same-text pairs
+score ~0.95 IoU and changed-text pairs ~0.15.
+
+Graceful degradation: styles without a saturated border (or too small to
+produce `min_pixels` mask pixels) never split — blocks just merge as before.
 """
 
 import cv2
@@ -20,42 +25,69 @@ import numpy as np
 class TextChangeSplitter:
     """Stateful comparator fed one positive-frame crop at a time."""
 
-    def __init__(self, iou_threshold=0.5, brightness=200, min_pixels=40):
+    # How far (in pixels) a bright pixel may sit from the saturated border
+    # and still count as a glyph core. 7x7 = 3px reach.
+    _DILATE_KERNEL = np.ones((7, 7), np.uint8)
+
+    def __init__(self, iou_threshold=0.5, brightness=200, saturation=100,
+                 min_pixels=40):
         """
         Args:
             iou_threshold: Split when the overlap (intersection over union)
-                between consecutive bright masks falls below this. Lower =
+                between consecutive glyph masks falls below this. Lower =
                 split less eagerly.
             brightness: Grayscale value (0-255) a pixel must reach to count
-                as subtitle text. 200 captures white/yellow subs; dark or
-                saturated-color styles fall below it and disable splitting.
-            min_pixels: Minimum bright pixels in BOTH masks to attempt a
+                as a glyph core.
+            saturation: HSV saturation a pixel must reach to count as the
+                colored glyph border.
+            min_pixels: Minimum mask pixels in BOTH frames to attempt a
                 comparison — guards against judging from noise.
         """
         self.iou_threshold = iou_threshold
         self.brightness = brightness
+        self.saturation = saturation
         self.min_pixels = min_pixels
         self._prev = None
+        self._prev_changed = False
 
     def reset(self):
-        """Forget the previous frame (call when no subtitle is visible)."""
+        """Forget the previous frame (call on a class change)."""
         self._prev = None
+        self._prev_changed = False
+
+    def _glyph_mask(self, crop):
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        border = ((hsv[:, :, 1] >= self.saturation)
+                  & (hsv[:, :, 2] >= 80)).astype(np.uint8)
+        near_border = cv2.dilate(border, self._DILATE_KERNEL).astype(bool)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        return (gray >= self.brightness) & near_border
 
     def update(self, crop):
         """Feed the next subtitle-positive crop. Returns True if its text
-        differs from the previous positive frame's (i.e. a new subtitle)."""
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        mask = gray >= self.brightness
+        differs from the previous positive frame's (i.e. a new subtitle).
+
+        Stability rule: a change only fires when the PREVIOUS comparison was
+        stable. During a fade/pop-in animation the mask morphs continuously
+        (every comparison reads as change), so nothing fires; a settled
+        subtitle replaced by another gives stable -> change and fires once.
+        """
+        mask = self._glyph_mask(crop)
 
         prev, self._prev = self._prev, mask
         if prev is None or prev.shape != mask.shape:
+            self._prev_changed = False
             return False
 
         a = int(np.count_nonzero(mask))
         b = int(np.count_nonzero(prev))
         if a < self.min_pixels or b < self.min_pixels:
+            self._prev_changed = False
             return False
 
         intersection = int(np.count_nonzero(mask & prev))
         union = a + b - intersection
-        return (intersection / union) < self.iou_threshold
+        changed = (intersection / union) < self.iou_threshold
+        fire = changed and not self._prev_changed
+        self._prev_changed = changed
+        return fire

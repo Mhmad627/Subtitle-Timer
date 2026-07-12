@@ -96,9 +96,10 @@ if you ever need to adjust the positions.
 
 The model only answers no/N/S per frame; when one N sentence instantly
 replaces another, the boundary between them is found separately by
-[detector/text_change.py](detector/text_change.py): it compares bright-pixel
-masks between consecutive frames and splits the block when the glyph
-pattern changes (`--split-iou`, default 0.5; 0 disables).
+[detector/text_change.py](detector/text_change.py): it compares glyph masks
+(bright core pixels near the saturated border) between consecutive frames
+and splits the block when the pattern changes (`--split-iou`, default 0.5;
+0 disables).
 
 **N only, by design.** S runs are never split this way: the S style is dark
 text on a bright banner, which the bright-pixel mask can't track. An S block

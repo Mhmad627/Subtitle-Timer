@@ -12,7 +12,8 @@ def sample_frames(video_path, fps=2.0):
 
     Args:
         video_path: Path to the video file.
-        fps: Desired sampling rate in frames per second.
+        fps: Desired sampling rate in frames per second. Zero (or None)
+            means every native frame — frame-accurate sampling.
 
     Yields:
         (timestamp, frame): timestamp in seconds (float), frame as a BGR
@@ -29,7 +30,10 @@ def sample_frames(video_path, fps=2.0):
             native_fps = 30.0
 
         # How many native frames to advance between samples (at least 1).
-        stride = max(1, int(round(native_fps / fps)))
+        if fps and fps > 0:
+            stride = max(1, int(round(native_fps / fps)))
+        else:
+            stride = 1  # every frame
 
         frame_index = 0
         while True:
