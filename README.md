@@ -33,15 +33,19 @@ pip install -r requirements.txt
 python gui.py
 ```
 
-Browse for a video, scrub to a moment where a subtitle is visible, drag the
-green box onto the subtitle area (corners resize it), and click **Detect
-Subtitles**. Pick your trained `.onnx` in the model field once you have one.
+Browse for a video, scrub to a moment where a subtitle is visible, and place
+the green box on the N-subtitle area and the orange box on the S-subtitle
+area (drag to move, corners resize; or type exact x/y/w/h fractions into the
+preset fields — positions are remembered between runs). Click **Detect
+Subtitles** — one run times both styles. Pick your trained `.onnx` in the
+model field once you have one.
 
 ### Command line
 
 ```bash
 python main.py --input video.mp4
-python main.py --input video.mp4 --crop 0.1 0.8 0.8 0.15 --fps 5
+python main.py --input video.mp4 --crop-n 0.1 0.8 0.8 0.15 --fps 5
+python main.py --input video.mp4 --crop-n 0 0.75 1 0.25 --crop-s 0 0.55 1 0.2
 python main.py --input video.mp4 --model subtitle_detector.onnx
 ```
 
@@ -52,7 +56,8 @@ python main.py --input video.mp4 --model subtitle_detector.onnx
 | `--input`         | (required)       | Path to the input video file.                              |
 | `--output`        | `<input>.srt`    | Path to the output `.srt` file.                            |
 | `--fps`           | `0`              | Sampling rate; 0 = every frame (frame-accurate timing).    |
-| `--crop`          | `0 0.75 1 0.25`  | Subtitle box `X Y W H` as fractions of the frame.          |
+| `--crop-n`        | `0 0.75 1 0.25`  | N-subtitle box `X Y W H` as fractions of the frame.        |
+| `--crop-s`        | (off)            | S-subtitle box `X Y W H`; omit to skip S detection.        |
 | `--model`         | (heuristic)      | Trained `.onnx` presence model.                            |
 | `--threshold`     | `0.5`            | Detection score cutoff (0–1); lower catches more.          |
 | `--max-gap`       | `0.3`            | Longest silence (s) bridged inside one block.              |
@@ -65,7 +70,7 @@ python main.py --input video.mp4 --model subtitle_detector.onnx
 ```
 Video file
   → Sample frames at N fps (OpenCV)          detector/frame_sampler.py
-  → Crop the user-positioned subtitle box    detector/subtitle_region.py
+  → Crop the per-style subtitle boxes        detector/subtitle_region.py
   → Classify each frame: no / N / S          detector/presence.py
   → Spot text changes (back-to-back subs)    detector/text_change.py
   → Group runs into timed blocks             utils/grouping.py

@@ -40,6 +40,10 @@ class HeuristicDetector:
     cannot distinguish the S style, so every detection is labelled "N".
     """
 
+    # This detector cannot tell the S style from N (see class docstring), so
+    # per-style crop boxes accept any positive it reports.
+    distinguishes_styles = False
+
     # Edge densities at or above this map to score 1.0. Text in a tight crop
     # typically lands in the 0.02-0.15 range; empty frames well below 0.01.
     _FULL_SCALE_DENSITY = 0.05
@@ -63,6 +67,10 @@ class OnnxDetector:
     The model must take a (1, 3, MODEL_INPUT_H, MODEL_INPUT_W) RGB tensor in
     [0, 1] and output softmax probabilities in CLASS_NAMES order.
     """
+
+    # The 3-class model does tell N from S, so a per-style crop box only
+    # accepts detections of its own class.
+    distinguishes_styles = True
 
     def __init__(self, model_path, threshold=0.5):
         self.threshold = threshold

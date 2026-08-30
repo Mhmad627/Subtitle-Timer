@@ -1,17 +1,21 @@
 """Subtitle Timer — desktop GUI.
 
-Pick a video, drag/resize the green box onto the subtitle area (scrub to a
-moment where a subtitle is visible), and click Detect. The app samples
-frames, classifies each as no / N / S, groups same-label runs into timed
-blocks (S blocks become three ASS-tagged lines), and writes an .srt. Until
-your trained model (.onnx) is selected, a simple edge-density heuristic
-stands in and labels everything N.
+Pick a video, place the green box on the N-subtitle area and the orange box
+on the S-subtitle area (scrub to a moment where a subtitle is visible), and
+click Detect — one run covers both styles. Boxes can be dragged/resized on
+the preview or typed in as exact x/y/w/h fractions; their positions are
+saved and restored on the next launch. The app samples frames, classifies
+each box's crop as no / N / S, groups same-label runs into timed blocks
+(S blocks become three ASS-tagged lines), and writes an .srt. Until your
+trained model (.onnx) is selected, a simple edge-density heuristic stands
+in and labels everything it finds as its box's class.
 
 Run directly:   python gui.py
 Or build an exe: pyinstaller subtitle_extractor.spec
 """
 
 import base64
+import json
 import os
 import queue
 import sys
@@ -22,7 +26,7 @@ from types import SimpleNamespace
 
 import cv2
 
-from detector.subtitle_region import DEFAULT_CROP, clamp_rect
+from detector.subtitle_region import DEFAULT_CROP, DEFAULT_CROP_S, clamp_rect
 from output.srt_writer import write_srt
 import main as pipeline
 
@@ -36,10 +40,16 @@ if sys.stderr is None:
 
 PREVIEW_MAX_W = 480
 PREVIEW_MAX_H = 270
-BOX_COLOR = "#00e000"
+# One crop box per subtitle style, each with its own color.
+BOX_COLORS = {"N": "#00e000", "S": "#ff9500"}
+BOX_ORDER = ("N", "S")     # build/draw order; hit-testing prefers the last
 HANDLE_SIZE = 8        # px, corner squares
 GRAB_RADIUS = 10       # px, how close to a corner counts as grabbing it
 MIN_BOX_PX = 12        # px, minimum box width/height while resizing
+
+# Box positions are remembered here between runs (the subtitle areas are in
+# the same place in every video).
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".subtitle_timer.json")
 
 
 class _QueueWriter:
@@ -145,12 +155,19 @@ class SubtitleTimerGUI:
         self._preview_frame_bgr = None    # cached full-res BGR frame
         self._preview_photo = None        # keep a ref or Tk drops the image
         self._preview_job = None          # pending debounced reload
+        self._preview_cap = None          # open VideoCapture for live scrubbing
+        self._preview_cap_path = None     # path the open capture belongs to
+        self._scrub_pending = False       # a coalesced scrub redraw is queued
         self._img_size = None             # displayed image (w, h) in px
-        self._crop = list(DEFAULT_CROP)   # (x, y, w, h) as frame fractions
+        # One (x, y, w, h) fraction rect per style box.
+        self._crops = {"N": list(DEFAULT_CROP), "S": list(DEFAULT_CROP_S)}
         self._drag = None                 # active drag state, see _on_box_press
+        self._syncing_entries = False     # guard: drag -> entry sync loops
 
+        self._load_config()
         self._build_widgets()
         self._poll_log_queue()
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------- layout ----------
 
@@ -198,9 +215,10 @@ class SubtitleTimerGUI:
         info.pack(side="left", padx=(0, 8))
         _Tooltip(info, _HELP["model"])
 
-        # Preview with the draggable subtitle box
+        # Preview with one draggable box per subtitle style
         prev_frame = ttk.LabelFrame(
-            self.root, text="Preview — drag the green box onto the subtitle area"
+            self.root,
+            text="Preview — green box = N subtitles, orange box = S subtitles",
         )
         prev_frame.pack(fill="x", **pad)
 
@@ -221,14 +239,36 @@ class SubtitleTimerGUI:
         self.scrub_var = tk.DoubleVar(value=50.0)
         ttk.Scale(
             scrub_row, from_=0.0, to=100.0, variable=self.scrub_var,
-            command=lambda _v: self._schedule_preview_load(),
+            command=lambda _v: self._on_scrub(),
         ).pack(side="left", fill="x", expand=True, padx=6)
 
-        self.box_var = tk.StringVar()
-        ttk.Label(prev_frame, textvariable=self.box_var).pack(
-            anchor="w", padx=6, pady=(0, 6)
-        )
-        self._update_box_readout()
+        # Per-box x/y/w/h preset fields, kept in sync with dragging.
+        preset = ttk.Frame(prev_frame)
+        preset.pack(fill="x", padx=6, pady=(2, 6))
+        self._crop_vars = {}
+        for row, key in enumerate(BOX_ORDER):
+            tk.Label(
+                preset, text=f"{key} box:", foreground=BOX_COLORS[key],
+                font=("TkDefaultFont", 9, "bold"),
+            ).grid(row=row, column=0, sticky="e", padx=(0, 4), pady=2)
+            field_vars = []
+            for col, name in enumerate(("x", "y", "w", "h")):
+                ttk.Label(preset, text=f"{name}=").grid(
+                    row=row, column=1 + col * 2, sticky="e"
+                )
+                var = tk.StringVar()
+                ttk.Entry(preset, textvariable=var, width=7).grid(
+                    row=row, column=2 + col * 2, sticky="w", padx=(0, 8), pady=2
+                )
+                var.trace_add("write", lambda *_a, k=key: self._on_crop_entry(k))
+                field_vars.append(var)
+            self._crop_vars[key] = field_vars
+            self._sync_crop_entries(key)
+        ttk.Label(
+            preset,
+            text="fractions of the frame (0–1); drag inside a box to move, "
+                 "corners to resize — positions are saved for next time",
+        ).grid(row=2, column=0, columnspan=9, sticky="w", pady=(2, 0))
 
         # Options
         opt = ttk.LabelFrame(self.root, text="Options")
@@ -286,30 +326,67 @@ class SubtitleTimerGUI:
     # ---------- preview ----------
 
     def _schedule_preview_load(self):
-        """Debounce reloads (typing a path / dragging the scrub bar)."""
+        """Debounce reloads while a path is being typed."""
         if self._preview_job is not None:
             self.root.after_cancel(self._preview_job)
         self._preview_job = self.root.after(150, self._load_preview_frame)
+
+    def _on_scrub(self):
+        """Live-update the preview while the slider is being dragged.
+
+        The Scale fires for every pixel of motion; redrawing via after_idle
+        lets queued slider events collapse into one decode at the latest
+        position, so the drag stays smooth on slow-seeking videos.
+        """
+        if self._scrub_pending:
+            return
+        self._scrub_pending = True
+        self.root.after_idle(self._do_scrub)
+
+    def _do_scrub(self):
+        self._scrub_pending = False
+        self._load_preview_frame()
+
+    def _get_preview_cap(self, path):
+        """Return an open VideoCapture for `path`, reusing the cached one.
+
+        Keeping the capture open between scrub ticks is what makes live
+        scrubbing feasible — reopening the file per tick is far too slow.
+        """
+        if self._preview_cap is not None and self._preview_cap_path == path:
+            return self._preview_cap
+        self._release_preview_cap()
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        self._preview_cap = cap
+        self._preview_cap_path = path
+        return cap
+
+    def _release_preview_cap(self):
+        if self._preview_cap is not None:
+            self._preview_cap.release()
+        self._preview_cap = None
+        self._preview_cap_path = None
 
     def _load_preview_frame(self):
         self._preview_job = None
         path = self.input_var.get().strip()
         if not os.path.isfile(path):
+            self._release_preview_cap()
             self._draw_placeholder("No video selected.")
             return
 
-        cap = cv2.VideoCapture(path)
-        try:
-            if not cap.isOpened():
-                self._draw_placeholder("Could not open this file as a video.")
-                return
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            if total > 0:
-                index = int((self.scrub_var.get() / 100.0) * (total - 1))
-                cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-            ok, frame = cap.read()
-        finally:
-            cap.release()
+        cap = self._get_preview_cap(path)
+        if cap is None:
+            self._draw_placeholder("Could not open this file as a video.")
+            return
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total > 0:
+            index = int((self.scrub_var.get() / 100.0) * (total - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ok, frame = cap.read()
 
         if not ok or frame is None:
             self._draw_placeholder("Could not read a frame from this video.")
@@ -349,112 +426,169 @@ class SubtitleTimerGUI:
         self.canvas.config(width=iw, height=ih)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, image=self._preview_photo, anchor="nw")
-        self._draw_crop_box()
+        self._draw_crop_boxes()
 
-    # ---------- crop box ----------
+    # ---------- crop boxes ----------
 
-    def _box_px(self):
-        """Current crop box in canvas pixels: (x0, y0, x1, y1)."""
+    def _box_px(self, key):
+        """A style's crop box in canvas pixels: (x0, y0, x1, y1)."""
         iw, ih = self._img_size
-        x, y, w, h = self._crop
+        x, y, w, h = self._crops[key]
         return (x * iw, y * ih, (x + w) * iw, (y + h) * ih)
 
-    def _set_box_px(self, x0, y0, x1, y1):
+    def _set_box_px(self, key, x0, y0, x1, y1):
         """Store a pixel box back as clamped frame fractions."""
         iw, ih = self._img_size
         x0, x1 = sorted((x0, x1))
         y0, y1 = sorted((y0, y1))
-        self._crop = list(clamp_rect(
+        self._crops[key] = list(clamp_rect(
             (x0 / iw, y0 / ih, (x1 - x0) / iw, (y1 - y0) / ih)
         ))
-        self._update_box_readout()
+        self._sync_crop_entries(key)
 
-    def _draw_crop_box(self):
+    def _draw_crop_boxes(self):
         self.canvas.delete("cropbox")
         if self._img_size is None:
             return
-        x0, y0, x1, y1 = self._box_px()
-        self.canvas.create_rectangle(
-            x0, y0, x1, y1, outline=BOX_COLOR, width=2, tags="cropbox"
-        )
         r = HANDLE_SIZE / 2
-        for cx, cy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+        for key in BOX_ORDER:
+            color = BOX_COLORS[key]
+            x0, y0, x1, y1 = self._box_px(key)
             self.canvas.create_rectangle(
-                cx - r, cy - r, cx + r, cy + r,
-                outline=BOX_COLOR, fill=BOX_COLOR, tags="cropbox",
+                x0, y0, x1, y1, outline=color, width=2, tags="cropbox"
             )
+            self.canvas.create_text(
+                x0 + 4, y0 + 2, text=key, fill=color, anchor="nw",
+                font=("TkDefaultFont", 9, "bold"), tags="cropbox",
+            )
+            for cx, cy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+                self.canvas.create_rectangle(
+                    cx - r, cy - r, cx + r, cy + r,
+                    outline=color, fill=color, tags="cropbox",
+                )
 
-    def _update_box_readout(self):
-        x, y, w, h = self._crop
-        self.box_var.set(
-            f"Box: x={x:.2f}  y={y:.2f}  w={w:.2f}  h={h:.2f}   "
-            "(drag inside to move, corners to resize)"
-        )
+    def _sync_crop_entries(self, key):
+        """Push a box's fractions into its entry fields (drag -> entries)."""
+        self._syncing_entries = True
+        try:
+            for var, value in zip(self._crop_vars[key], self._crops[key]):
+                var.set(f"{value:.3f}")
+        finally:
+            self._syncing_entries = False
+
+    def _on_crop_entry(self, key):
+        """Apply typed preset values to a box (entries -> box)."""
+        if self._syncing_entries:
+            return
+        try:
+            rect = tuple(float(var.get()) for var in self._crop_vars[key])
+        except (ValueError, tk.TclError):
+            return  # mid-typing, not a full number yet
+        self._crops[key] = list(clamp_rect(rect))
+        self._draw_crop_boxes()
 
     def _hit_test(self, ex, ey):
-        """What is under the mouse: ('corner', anchor_px) / 'inside' / None."""
+        """What is under the mouse: (box, 'corner', anchor) /
+        (box, 'inside', None) / None.
+
+        Corners of either box win over interiors, and later-drawn boxes win
+        ties, so overlapping boxes stay individually grabbable.
+        """
         if self._img_size is None:
             return None
-        x0, y0, x1, y1 = self._box_px()
-        corners = {
-            (x0, y0): (x1, y1),
-            (x1, y0): (x0, y1),
-            (x0, y1): (x1, y0),
-            (x1, y1): (x0, y0),
-        }
-        for (cx, cy), anchor in corners.items():
-            if abs(ex - cx) <= GRAB_RADIUS and abs(ey - cy) <= GRAB_RADIUS:
-                return ("corner", anchor)
-        if x0 <= ex <= x1 and y0 <= ey <= y1:
-            return "inside"
+        for key in reversed(BOX_ORDER):
+            x0, y0, x1, y1 = self._box_px(key)
+            corners = {
+                (x0, y0): (x1, y1),
+                (x1, y0): (x0, y1),
+                (x0, y1): (x1, y0),
+                (x1, y1): (x0, y0),
+            }
+            for (cx, cy), anchor in corners.items():
+                if abs(ex - cx) <= GRAB_RADIUS and abs(ey - cy) <= GRAB_RADIUS:
+                    return (key, "corner", anchor)
+        for key in reversed(BOX_ORDER):
+            x0, y0, x1, y1 = self._box_px(key)
+            if x0 <= ex <= x1 and y0 <= ey <= y1:
+                return (key, "inside", None)
         return None
 
     def _on_box_hover(self, event):
         hit = self._hit_test(event.x, event.y)
-        if hit == "inside":
-            self.canvas.config(cursor="fleur")
-        elif hit is not None:
-            self.canvas.config(cursor="sizing")
-        else:
+        if hit is None:
             self.canvas.config(cursor="")
+        elif hit[1] == "inside":
+            self.canvas.config(cursor="fleur")
+        else:
+            self.canvas.config(cursor="sizing")
 
     def _on_box_press(self, event):
         hit = self._hit_test(event.x, event.y)
-        if hit == "inside":
-            x0, y0, _x1, _y1 = self._box_px()
-            self._drag = ("move", event.x - x0, event.y - y0)
-        elif hit is not None:
-            _kind, anchor = hit
-            self._drag = ("resize", anchor)
-        else:
+        if hit is None:
             self._drag = None
+            return
+        key, kind, anchor = hit
+        if kind == "inside":
+            x0, y0, _x1, _y1 = self._box_px(key)
+            self._drag = (key, "move", (event.x - x0, event.y - y0))
+        else:
+            self._drag = (key, "resize", anchor)
 
     def _on_box_drag(self, event):
         if self._drag is None or self._img_size is None:
             return
+        key, mode, data = self._drag
         iw, ih = self._img_size
         ex = min(max(event.x, 0), iw)
         ey = min(max(event.y, 0), ih)
 
-        if self._drag[0] == "move":
-            _mode, off_x, off_y = self._drag
-            x0, y0, x1, y1 = self._box_px()
+        if mode == "move":
+            off_x, off_y = data
+            x0, y0, x1, y1 = self._box_px(key)
             bw, bh = x1 - x0, y1 - y0
             nx0 = min(max(ex - off_x, 0), iw - bw)
             ny0 = min(max(ey - off_y, 0), ih - bh)
-            self._set_box_px(nx0, ny0, nx0 + bw, ny0 + bh)
+            self._set_box_px(key, nx0, ny0, nx0 + bw, ny0 + bh)
         else:  # resize: box spans from the fixed opposite corner to the mouse
-            _mode, (ax, ay) = self._drag
+            ax, ay = data
             if abs(ex - ax) < MIN_BOX_PX:
                 ex = ax + MIN_BOX_PX if ex >= ax else ax - MIN_BOX_PX
             if abs(ey - ay) < MIN_BOX_PX:
                 ey = ay + MIN_BOX_PX if ey >= ay else ay - MIN_BOX_PX
-            self._set_box_px(ax, ay, ex, ey)
+            self._set_box_px(key, ax, ay, ex, ey)
 
-        self._draw_crop_box()
+        self._draw_crop_boxes()
 
     def _on_box_release(self, _event):
         self._drag = None
+
+    # ---------- saved settings ----------
+
+    def _load_config(self):
+        """Restore box presets saved by a previous run."""
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            for key in BOX_ORDER:
+                rect = data.get(f"crop_{key.lower()}")
+                if isinstance(rect, list) and len(rect) == 4:
+                    self._crops[key] = list(clamp_rect([float(v) for v in rect]))
+        except (OSError, ValueError, TypeError):
+            pass  # no config yet / unreadable — keep defaults
+
+    def _save_config(self):
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {f"crop_{k.lower()}": self._crops[k] for k in BOX_ORDER}, fh
+                )
+        except OSError:
+            pass  # non-fatal: presets just won't persist
+
+    def _on_close(self):
+        self._save_config()
+        self._release_preview_cap()
+        self.root.destroy()
 
     # ---------- actions ----------
 
@@ -528,7 +662,8 @@ class SubtitleTimerGUI:
                 input=input_path,
                 output=self.output_var.get().strip() or None,
                 fps=float(self.fps_var.get()),
-                crop=tuple(self._crop),
+                crop_n=tuple(self._crops["N"]),
+                crop_s=tuple(self._crops["S"]),
                 model=model_path,
                 threshold=float(self.threshold_var.get()),
                 max_gap=0.3,
@@ -540,6 +675,7 @@ class SubtitleTimerGUI:
             messagebox.showerror("Invalid option", f"Check numeric fields:\n{exc}")
             return
 
+        self._save_config()
         self._cancel_event = threading.Event()
         self.run_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")

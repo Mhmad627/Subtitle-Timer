@@ -5,8 +5,12 @@ The region is a rectangle expressed as fractions of the frame size
 the user drag/resize this box on a preview; the CLI takes it as --crop.
 """
 
-# Bottom quarter, full width — a sensible starting box for most subtitles.
+# Bottom quarter, full width — a sensible starting box for most N subtitles.
 DEFAULT_CROP = (0.0, 0.75, 1.0, 0.25)
+
+# Starting box for the S style — placed above the N box so both are visible
+# on first run; users move it to where their S subtitles actually appear.
+DEFAULT_CROP_S = (0.0, 0.55, 1.0, 0.2)
 
 
 def clamp_rect(rect):
