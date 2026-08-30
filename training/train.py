@@ -89,14 +89,36 @@ def load_folder(folder, class_index):
     return images, labels
 
 
-def augment_batch(batch):
-    """Light augmentation: brightness/contrast jitter + small horizontal shift.
+def random_recolor(img):
+    """Rotate hue by a random amount and jitter saturation.
+
+    Makes the model color-blind to the N outline: the white glyph core
+    (low saturation) is untouched by hue rotation, while the saturated
+    outline comes out a different color every epoch — so the model must
+    learn "white core + saturated outline of ANY color" instead of
+    memorizing one outline color.
+    """
+    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)  # float32: H in [0,360)
+    hsv[..., 0] = (hsv[..., 0] + random.uniform(0.0, 360.0)) % 360.0
+    hsv[..., 1] = np.clip(hsv[..., 1] * random.uniform(0.7, 1.3), 0.0, 1.0)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+
+def augment_batch(batch, labels):
+    """Light augmentation: brightness/contrast jitter + small horizontal shift,
+    plus random recoloring for non-S classes.
 
     Keeps the model robust to exposure changes and to the user not placing
-    the crop box in exactly the same spot every time.
+    the crop box in exactly the same spot every time. Hue rotation applies
+    to N (outline color varies between videos) and to "no" (so recolored
+    backgrounds don't become an accidental N-only cue) — never to S, whose
+    banner color is a fixed part of its look.
     """
     out = np.empty_like(batch)
-    for i, img in enumerate(batch):
+    s_index = CLASS_NAMES.index("S")
+    for i, (img, label) in enumerate(zip(batch, labels)):
+        if label != s_index:
+            img = random_recolor(np.ascontiguousarray(img))
         img = img * random.uniform(0.7, 1.3)                    # brightness
         img = (img - 0.5) * random.uniform(0.8, 1.2) + 0.5      # contrast
         shift = random.randint(-8, 8)
@@ -174,7 +196,7 @@ def main(argv=None):
         total_loss = 0.0
         for i in range(0, len(perm), args.batch_size):
             idx = perm[i:i + args.batch_size]
-            batch = to_tensor(augment_batch(train_x[idx])).to(device)
+            batch = to_tensor(augment_batch(train_x[idx], train_y[idx])).to(device)
             target = torch.from_numpy(train_y[idx]).to(device)
 
             optimizer.zero_grad()
