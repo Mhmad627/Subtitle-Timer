@@ -15,6 +15,7 @@ Or build an exe: pyinstaller subtitle_extractor.spec
 """
 
 import base64
+import glob
 import json
 import os
 import queue
@@ -50,6 +51,31 @@ MIN_BOX_PX = 12        # px, minimum box width/height while resizing
 # Box positions are remembered here between runs (the subtitle areas are in
 # the same place in every video).
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".subtitle_timer.json")
+
+# Last-resort place to look for the trained model: the user keeps it in the
+# project folder even when the exe is run from somewhere else.
+MODEL_HOME = r"C:\Users\hjasi\Desktop\Subtitle Timer"
+
+
+def find_default_model():
+    """Find the trained .onnx automatically so the field starts filled in.
+
+    Looks in the app's own directory and up to two parents (the exe lives in
+    dist/SubtitleExtractor/, two levels below the project root where the
+    model is kept), then falls back to MODEL_HOME. Newest model wins if
+    there are several (they get retrained often).
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    search_dirs = [base, os.path.dirname(base), os.path.dirname(os.path.dirname(base))]
+    search_dirs.append(MODEL_HOME)
+    for directory in search_dirs:
+        candidates = glob.glob(os.path.join(directory, "*.onnx"))
+        if candidates:
+            return max(candidates, key=os.path.getmtime)
+    return None
 
 
 class _QueueWriter:
@@ -198,13 +224,15 @@ class SubtitleTimerGUI:
             side="left", padx=6, pady=6
         )
 
-        # Model row
+        # Model row (pre-filled automatically when a .onnx is found)
         model_frame = ttk.LabelFrame(
-            self.root, text="Detection model (.onnx) — blank = built-in heuristic"
+            self.root,
+            text="Detection model (.onnx) — found automatically; "
+                 "blank = built-in heuristic",
         )
         model_frame.pack(fill="x", **pad)
 
-        self.model_var = tk.StringVar()
+        self.model_var = tk.StringVar(value=find_default_model() or "")
         ttk.Entry(model_frame, textvariable=self.model_var).pack(
             side="left", fill="x", expand=True, padx=6, pady=6
         )

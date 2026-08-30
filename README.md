@@ -37,8 +37,13 @@ Browse for a video, scrub to a moment where a subtitle is visible, and place
 the green box on the N-subtitle area and the orange box on the S-subtitle
 area (drag to move, corners resize; or type exact x/y/w/h fractions into the
 preset fields — positions are remembered between runs). Click **Detect
-Subtitles** — one run times both styles. Pick your trained `.onnx` in the
-model field once you have one.
+Subtitles** — one run times both styles. The model field fills itself in
+with the newest `.onnx` found next to the app (or in the project folder);
+leave it blank to use the built-in heuristic.
+
+After timing, any block whose end lands on a second ending in the digit 7
+is moved 3 s earlier (a quirk of the source videos), along with the start
+of a line beginning at that same boundary.
 
 ### Command line
 

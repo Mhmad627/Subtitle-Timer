@@ -29,7 +29,7 @@ from detector.frame_sampler import sample_frames
 from detector.subtitle_region import DEFAULT_CROP, crop_rect
 from detector.presence import load_detector
 from detector.text_change import TextChangeSplitter
-from utils.grouping import expand_s_blocks, group_detections
+from utils.grouping import expand_s_blocks, fix_seven_endings, group_detections
 from output.srt_writer import write_srt
 
 
@@ -223,7 +223,11 @@ def run_detection(args, should_cancel=None):
     n_s = sum(1 for b in blocks if b.label == "S")
     if n_s:
         print(f"Expanding {n_s} S block(s) into 3 tagged lines each...")
-    return expand_s_blocks(blocks)
+    blocks = expand_s_blocks(blocks)
+    n_shifted = fix_seven_endings(blocks)
+    if n_shifted:
+        print(f"Moved {n_shifted} block end(s) landing on a 7-second back by 3 s.")
+    return blocks
 
 
 def main(argv=None):

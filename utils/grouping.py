@@ -86,6 +86,34 @@ def group_detections(detections, fps, max_gap=0.3, min_duration=0.25, text="..."
     return blocks
 
 
+def fix_seven_endings(blocks, shift=3.0, tol=1e-3):
+    """Shift block ends landing on a second that ends in 7 back by 3 s.
+
+    User-observed quirk of the source videos: whenever a block's end time
+    falls on a wall-clock second whose last digit is 7 (00:00:07,
+    00:30:57, ...), it is 3 seconds late. This moves such ends 3 s earlier,
+    and moves the start of any block that began at that exact boundary back
+    with it, so back-to-back lines stay contiguous (S triplets share their
+    timing, so all three lines shift together). A block too short to
+    survive the shift is left untouched.
+
+    Mutates `blocks` (time-ordered) in place; returns how many ends moved.
+    """
+    shifted = 0
+    for i, block in enumerate(blocks):
+        if int(block.end) % 10 != 7:
+            continue
+        if block.end - shift <= block.start:
+            continue  # would invert the block; leave it alone
+        old_end = block.end
+        block.end -= shift
+        shifted += 1
+        for later in blocks[i + 1:]:
+            if abs(later.start - old_end) <= tol:
+                later.start -= shift
+    return shifted
+
+
 def expand_s_blocks(blocks, tags=S_LINE_TAGS):
     """Replace each S block with len(tags) lines sharing its timing.
 
