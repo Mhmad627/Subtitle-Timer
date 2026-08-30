@@ -226,7 +226,8 @@ def run_detection(args, should_cancel=None):
     blocks = expand_s_blocks(blocks)
     n_shifted = fix_seven_endings(blocks)
     if n_shifted:
-        print(f"Moved {n_shifted} block end(s) landing on a 7-second back by 3 s.")
+        print(f"Moved {n_shifted} block end(s) landing on a .x7 centisecond "
+              "back by 0.03 s.")
     return blocks
 
 

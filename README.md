@@ -41,9 +41,10 @@ Subtitles** — one run times both styles. The model field fills itself in
 with the newest `.onnx` found next to the app (or in the project folder);
 leave it blank to use the built-in heuristic.
 
-After timing, any block whose end lands on a second ending in the digit 7
-is moved 3 s earlier (a quirk of the source videos), along with the start
-of a line beginning at that same boundary.
+After timing, any block whose end lands on a centisecond ending in the
+digit 7 (e.g. `0:00:30.57`) is moved 0.03 s earlier to end in 4 (a
+frame-rounding quirk of the source videos), along with the start of a line
+beginning at that same boundary.
 
 ### Command line
 
