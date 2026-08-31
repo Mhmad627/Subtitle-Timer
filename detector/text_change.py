@@ -30,7 +30,7 @@ class TextChangeSplitter:
     _DILATE_KERNEL = np.ones((7, 7), np.uint8)
 
     def __init__(self, iou_threshold=0.5, brightness=200, saturation=100,
-                 min_pixels=40):
+                 min_pixels=300):
         """
         Args:
             iou_threshold: Split when the overlap (intersection over union)
@@ -41,7 +41,11 @@ class TextChangeSplitter:
             saturation: HSV saturation a pixel must reach to count as the
                 colored glyph border.
             min_pixels: Minimum mask pixels in BOTH frames to attempt a
-                comparison — guards against judging from noise.
+                comparison — guards against judging from noise. A real
+                glyph mask is thousands of pixels; a mask built from noise
+                pixels crossing the saturation threshold is at most a few
+                hundred, and comparing those random masks splits one
+                subtitle into chains of duplicate blocks.
         """
         self.iou_threshold = iou_threshold
         self.brightness = brightness
@@ -57,7 +61,13 @@ class TextChangeSplitter:
 
     def _glyph_mask(self, crop):
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        border = ((hsv[:, :, 1] >= self.saturation)
+        # Smooth the saturation plane before thresholding: on outline colors
+        # whose saturation rides near the threshold (e.g. tan), compression
+        # noise otherwise flips individual pixels across it every frame,
+        # producing a small random mask each frame — which reads as constant
+        # text change and chops one subtitle into duplicate blocks.
+        sat = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)
+        border = ((sat >= self.saturation)
                   & (hsv[:, :, 2] >= 80)).astype(np.uint8)
         near_border = cv2.dilate(border, self._DILATE_KERNEL).astype(bool)
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
