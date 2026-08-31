@@ -14,8 +14,16 @@ bright pixels NEAR saturated pixels. Background whites have no saturated
 border around them and drop out. Measured on real crops, same-text pairs
 score ~0.95 IoU and changed-text pairs ~0.15.
 
-Graceful degradation: styles without a saturated border (or too small to
-produce `min_pixels` mask pixels) never split — blocks just merge as before.
+Outline colors vary between videos, including weakly saturated ones (tan)
+that the strict saturation threshold misses entirely. The mask is therefore
+two-tier: the strict threshold first (tight, proven on strongly saturated
+outlines), and when that yields no usable mask, a lower fallback threshold
+that still catches the tan border. Validated on real footage: within one
+subtitle IoU stays >= ~0.84, and every text change dips below ~0.45 — for
+both tiers and across tier transitions (purple sub -> tan sub).
+
+Graceful degradation: styles where neither tier produces `min_pixels` mask
+pixels never split — blocks just merge as before.
 """
 
 import cv2
@@ -30,7 +38,7 @@ class TextChangeSplitter:
     _DILATE_KERNEL = np.ones((7, 7), np.uint8)
 
     def __init__(self, iou_threshold=0.5, brightness=200, saturation=100,
-                 min_pixels=300):
+                 saturation_fallback=55, min_pixels=300):
         """
         Args:
             iou_threshold: Split when the overlap (intersection over union)
@@ -39,7 +47,10 @@ class TextChangeSplitter:
             brightness: Grayscale value (0-255) a pixel must reach to count
                 as a glyph core.
             saturation: HSV saturation a pixel must reach to count as the
-                colored glyph border.
+                colored glyph border (strict first tier).
+            saturation_fallback: Lower saturation cutoff tried only when the
+                strict tier finds no usable mask — catches weakly saturated
+                outline colors like tan.
             min_pixels: Minimum mask pixels in BOTH frames to attempt a
                 comparison — guards against judging from noise. A real
                 glyph mask is thousands of pixels; a mask built from noise
@@ -50,6 +61,7 @@ class TextChangeSplitter:
         self.iou_threshold = iou_threshold
         self.brightness = brightness
         self.saturation = saturation
+        self.saturation_fallback = saturation_fallback
         self.min_pixels = min_pixels
         self._prev = None
         self._prev_changed = False
@@ -62,16 +74,24 @@ class TextChangeSplitter:
     def _glyph_mask(self, crop):
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         # Smooth the saturation plane before thresholding: on outline colors
-        # whose saturation rides near the threshold (e.g. tan), compression
-        # noise otherwise flips individual pixels across it every frame,
-        # producing a small random mask each frame — which reads as constant
-        # text change and chops one subtitle into duplicate blocks.
+        # whose saturation rides near a threshold, compression noise
+        # otherwise flips individual pixels across it every frame, producing
+        # a small random mask each frame — which reads as constant text
+        # change and chops one subtitle into duplicate blocks.
         sat = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)
-        border = ((sat >= self.saturation)
-                  & (hsv[:, :, 2] >= 80)).astype(np.uint8)
-        near_border = cv2.dilate(border, self._DILATE_KERNEL).astype(bool)
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        return (gray >= self.brightness) & near_border
+        bright = gray >= self.brightness
+        # Strict saturation first (proven tight mask for strongly saturated
+        # outlines); fall back to the lower cutoff only when it finds
+        # nothing, so weakly saturated outlines (tan) still get a mask.
+        mask = None
+        for cutoff in (self.saturation, self.saturation_fallback):
+            border = ((sat >= cutoff) & (hsv[:, :, 2] >= 80)).astype(np.uint8)
+            near_border = cv2.dilate(border, self._DILATE_KERNEL).astype(bool)
+            mask = bright & near_border
+            if np.count_nonzero(mask) >= self.min_pixels:
+                break
+        return mask
 
     def update(self, crop):
         """Feed the next subtitle-positive crop. Returns True if its text
