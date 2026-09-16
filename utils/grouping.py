@@ -106,6 +106,18 @@ def fix_seven_boundaries(blocks, shift=0.03, tol=1e-3):
     qualifies both sides shift by the same amount and stay touching — no
     separate "propagate to the neighbor" step is needed.
 
+    IMPORTANT: `blocks` must be ONE region's own time-ordered, non-
+    overlapping output from group_detections — the start-shift guard below
+    treats `blocks[i - 1].end` as "the previous subtitle's end" to avoid
+    creating an overlap. That's only true within a single region's own
+    timeline. Two independently-classified regions (e.g. N and N2, or N and
+    S) can legitimately be visible at once, so a block from one region
+    merged next to a longer-running block from another would wrongly be
+    treated as "still inside the previous subtitle" and its start would
+    never be corrected. Call this per region before merging; use
+    fix_seven_ends (which only ever looks at a block's own start, so it has
+    no such assumption) for a later, merged-list-safe end-only pass.
+
     Guards: a block is never shrunk past inversion (end vs. its own start),
     and a start is never pulled earlier than the immediately preceding
     block's already-resolved end, so blocks never end up overlapping or
@@ -120,6 +132,27 @@ def fix_seven_boundaries(blocks, shift=0.03, tol=1e-3):
         if _ends_in_seven(block.start) and block.start - shift >= floor - tol:
             block.start -= shift
             moved += 1
+        if _ends_in_seven(block.end) and block.end - shift > block.start:
+            block.end -= shift
+            moved += 1
+    return moved
+
+
+def fix_seven_ends(blocks, shift=0.03):
+    """Shift any block's END landing on a .x7 centisecond back by 0.03 s.
+
+    Unlike the start-shift in fix_seven_boundaries, this only ever compares
+    a block against its own start, never a neighbor — so it's safe to run
+    on a list merging multiple independently-timed regions that may
+    overlap in time. Meant as a final pass after add_s_delay, to catch a
+    freshly-delayed S end that now lands on .x7 (which an earlier,
+    per-region fix_seven_boundaries call couldn't have seen, since the
+    delay happens after regions are merged).
+
+    Mutates `blocks` in place; returns how many ends moved.
+    """
+    moved = 0
+    for block in blocks:
         if _ends_in_seven(block.end) and block.end - shift > block.start:
             block.end -= shift
             moved += 1

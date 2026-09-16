@@ -36,6 +36,7 @@ from utils.grouping import (
     add_s_delay,
     expand_s_blocks,
     fix_seven_boundaries,
+    fix_seven_ends,
     group_detections,
 )
 from output.srt_writer import write_srt
@@ -235,16 +236,23 @@ def run_detection(args, should_cancel=None):
     total = sum(len(hits) for hits in detections.values())
     print(f"{total} positive frames. Grouping into blocks...")
     # Group each box's stream separately (two boxes can be on screen at the
-    # same time), then interleave the blocks by start time.
+    # same time), then interleave the blocks by start time. The .x7 boundary
+    # fix runs here too, per region: it needs each region's own genuinely
+    # sequential, non-overlapping timeline to tell "the previous subtitle"
+    # from "an unrelated, still-running block from a different box" — a
+    # distinction that's lost once regions are merged.
     blocks = []
+    n_shifted = 0
     for region_id, _crop, _target in regions:
-        blocks.extend(group_detections(
+        region_blocks = group_detections(
             detections[region_id],
             fps=effective_fps,
             max_gap=args.max_gap,
             min_duration=args.min_duration,
             text=args.text,
-        ))
+        )
+        n_shifted += fix_seven_boundaries(region_blocks)
+        blocks.extend(region_blocks)
     blocks.sort(key=lambda b: b.start)
     n_s = sum(1 for b in blocks if b.label == "S")
     if n_s:
@@ -253,7 +261,10 @@ def run_detection(args, should_cancel=None):
     n_delayed = add_s_delay(blocks)
     if n_delayed:
         print(f"Delayed {n_delayed} S line end(s) by 0.16 s.")
-    n_shifted = fix_seven_boundaries(blocks)
+    # A delayed S end can land on .x7 too; fix_seven_ends only ever looks at
+    # a block's own start, so it's safe to run on the merged, multi-region
+    # list (unlike fix_seven_boundaries's start-shift, above).
+    n_shifted += fix_seven_ends(blocks)
     if n_shifted:
         print(f"Moved {n_shifted} block boundary(ies) landing on a .x7 "
               "centisecond back by 0.03 s.")
