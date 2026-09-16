@@ -41,10 +41,14 @@ Subtitles** — one run times both styles. The model field fills itself in
 with the newest `.onnx` found next to the app (or in the project folder);
 leave it blank to use the built-in heuristic.
 
-After timing, any block whose end lands on a centisecond ending in the
-digit 7 (e.g. `0:00:30.57`) is moved 0.03 s earlier to end in 4 (a
-frame-rounding quirk of the source videos), along with the start of a line
-beginning at that same boundary.
+After timing, two corrections run automatically:
+
+- Every S line's end is delayed by 0.16 s (the S banner's on-screen end lags
+  the detected end by that much).
+- Any block boundary — a start or an end — landing on a centisecond ending
+  in the digit 7 (e.g. `0:00:30.57`) is moved 0.03 s earlier to end in 4 (a
+  frame-rounding quirk of the source videos). Touching blocks share a
+  boundary value, so both sides shift together and stay contiguous.
 
 ### Command line
 
@@ -148,4 +152,8 @@ model is a separate small `.onnx` file you can swap without rebuilding.
 - [x] Training kit: dataset dumper + tiny 3-class CNN (no/N/S) + ONNX export
 - [x] S blocks → three ASS-tagged lines with shared timing
 - [x] Zero-gap boundary splitting (bright-mask IoU between frames)
-- [ ] Train the real model on target videos
+- [x] Train the real model on target videos
+- [x] Dual crop boxes (N + S) classified independently in one run
+- [x] Live-scrubbing preview + saved box presets
+- [x] Hue-jitter augmentation so N outline color doesn't affect detection
+- [x] Two-tier glyph mask so weakly saturated outlines still split correctly

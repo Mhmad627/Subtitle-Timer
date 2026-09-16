@@ -29,7 +29,12 @@ from detector.frame_sampler import sample_frames
 from detector.subtitle_region import DEFAULT_CROP, crop_rect
 from detector.presence import load_detector
 from detector.text_change import TextChangeSplitter
-from utils.grouping import expand_s_blocks, fix_seven_endings, group_detections
+from utils.grouping import (
+    add_s_delay,
+    expand_s_blocks,
+    fix_seven_boundaries,
+    group_detections,
+)
 from output.srt_writer import write_srt
 
 
@@ -224,10 +229,13 @@ def run_detection(args, should_cancel=None):
     if n_s:
         print(f"Expanding {n_s} S block(s) into 3 tagged lines each...")
     blocks = expand_s_blocks(blocks)
-    n_shifted = fix_seven_endings(blocks)
+    n_delayed = add_s_delay(blocks)
+    if n_delayed:
+        print(f"Delayed {n_delayed} S line end(s) by 0.16 s.")
+    n_shifted = fix_seven_boundaries(blocks)
     if n_shifted:
-        print(f"Moved {n_shifted} block end(s) landing on a .x7 centisecond "
-              "back by 0.03 s.")
+        print(f"Moved {n_shifted} block boundary(ies) landing on a .x7 "
+              "centisecond back by 0.03 s.")
     return blocks
 
 

@@ -86,34 +86,61 @@ def group_detections(detections, fps, max_gap=0.3, min_duration=0.25, text="..."
     return blocks
 
 
-def fix_seven_endings(blocks, shift=0.03, tol=1e-3):
-    """Shift block ends whose centiseconds end in 7 back by 0.03 s.
+def _ends_in_seven(t):
+    """True if `t`'s centisecond (hundredths of a second) digit is 7, the
+    way a subtitle editor displays it (e.g. 0:00:30.57)."""
+    return int(round(t * 100)) % 10 == 7
 
-    User-observed quirk of the source videos: whenever a block's end time
-    falls on a centisecond whose last digit is 7 (0:00:00.07, 0:00:30.57
-    in an ASS-style editor display, ...), it is 3 centiseconds late — a
-    frame-time rounding artifact. This moves such ends 0.03 s earlier so
-    they end in 4, and moves the start of any block that began at that
-    exact boundary back with it, so back-to-back lines stay contiguous
-    (S triplets share their timing, so all three lines shift together).
-    A block too short to survive the shift is left untouched.
 
-    Mutates `blocks` (time-ordered) in place; returns how many ends moved.
+def fix_seven_boundaries(blocks, shift=0.03, tol=1e-3):
+    """Shift any block boundary landing on a .x7 centisecond back by 0.03 s.
+
+    User-observed quirk of the source videos: whenever a timestamp — a
+    block's start OR its end — falls on a centisecond whose last digit is 7
+    (0:00:00.07, 0:00:30.57 in an ASS-style editor display, ...), it is 3
+    centiseconds late, a frame-time rounding artifact. Every boundary is
+    checked independently and shifted 0.03 s earlier so it ends in 4.
+
+    Two touching blocks (one's end equal to the next one's start) share the
+    same value and therefore the same digit, so when that boundary
+    qualifies both sides shift by the same amount and stay touching — no
+    separate "propagate to the neighbor" step is needed.
+
+    Guards: a block is never shrunk past inversion (end vs. its own start),
+    and a start is never pulled earlier than the immediately preceding
+    block's already-resolved end, so blocks never end up overlapping or
+    negative.
+
+    Mutates `blocks` (time-ordered by start) in place; returns how many
+    boundaries moved.
     """
-    shifted = 0
+    moved = 0
     for i, block in enumerate(blocks):
-        # Round to centiseconds the way a subtitle editor displays them.
-        if int(block.end * 100 + 0.5) % 10 != 7:
-            continue
-        if block.end - shift <= block.start:
-            continue  # would invert the block; leave it alone
-        old_end = block.end
-        block.end -= shift
-        shifted += 1
-        for later in blocks[i + 1:]:
-            if abs(later.start - old_end) <= tol:
-                later.start -= shift
-    return shifted
+        floor = blocks[i - 1].end if i > 0 else 0.0
+        if _ends_in_seven(block.start) and block.start - shift >= floor - tol:
+            block.start -= shift
+            moved += 1
+        if _ends_in_seven(block.end) and block.end - shift > block.start:
+            block.end -= shift
+            moved += 1
+    return moved
+
+
+def add_s_delay(blocks, delay=0.16):
+    """Add `delay` seconds to the end of every S block.
+
+    User-observed quirk: the S banner's on-screen end lags the model's
+    detected end by ~16 centiseconds. Applied after expand_s_blocks, so it
+    reaches all three tagged lines identically (they share timing).
+
+    Mutates `blocks` in place; returns how many ends were delayed.
+    """
+    delayed = 0
+    for block in blocks:
+        if block.label == "S":
+            block.end += delay
+            delayed += 1
+    return delayed
 
 
 def expand_s_blocks(blocks, tags=S_LINE_TAGS):
