@@ -12,6 +12,10 @@ DEFAULT_CROP = (0.0, 0.75, 1.0, 0.25)
 # on first run; users move it to where their S subtitles actually appear.
 DEFAULT_CROP_S = (0.0, 0.55, 1.0, 0.2)
 
+# Starting box for a second, optional N region — placed at the top so it
+# doesn't overlap the primary N box (bottom) by default.
+DEFAULT_CROP_N2 = (0.0, 0.02, 1.0, 0.15)
+
 
 def clamp_rect(rect):
     """Clamp an (x, y, w, h) fraction rect to a valid region inside the frame."""

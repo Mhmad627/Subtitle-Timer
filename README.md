@@ -1,8 +1,8 @@
 # Subtitle Timer
 
 Detect **when** burned-in subtitles are on screen and write a timed `.srt`
-with placeholder text. You position a crop box over the subtitle area and a
-classifier labels every sampled frame:
+with placeholder text. You position one or more crop boxes over the
+subtitle area(s) and a classifier labels every sampled frame:
 
 - **N** — normal subtitle → one timed block
 - **S** — special stacked style → three lines with identical timing and ASS
@@ -34,12 +34,15 @@ python gui.py
 ```
 
 Browse for a video, scrub to a moment where a subtitle is visible, and place
-the green box on the N-subtitle area and the orange box on the S-subtitle
-area (drag to move, corners resize; or type exact x/y/w/h fractions into the
-preset fields — positions are remembered between runs). Click **Detect
-Subtitles** — one run times both styles. The model field fills itself in
-with the newest `.onnx` found next to the app (or in the project folder);
-leave it blank to use the built-in heuristic.
+the green box on the N-subtitle area (drag to move, corners resize; or type
+exact x/y/w/h fractions into the preset fields — positions are remembered
+between runs). A second N box (blue) and an S box (orange) are available
+via checkboxes next to their preset rows — turn on the second N box for a
+video with normal subtitles in two different places, or turn off the S box
+for a video with no special style. Click **Detect Subtitles** — one run
+times every active box. The model field fills itself in with the newest
+`.onnx` found next to the app (or in the project folder); leave it blank to
+use the built-in heuristic.
 
 After timing, two corrections run automatically:
 
@@ -56,6 +59,7 @@ After timing, two corrections run automatically:
 python main.py --input video.mp4
 python main.py --input video.mp4 --crop-n 0.1 0.8 0.8 0.15 --fps 5
 python main.py --input video.mp4 --crop-n 0 0.75 1 0.25 --crop-s 0 0.55 1 0.2
+python main.py --input video.mp4 --crop-n 0 0.75 1 0.25 --crop-n2 0 0.02 1 0.15
 python main.py --input video.mp4 --model subtitle_detector.onnx
 ```
 
@@ -67,6 +71,7 @@ python main.py --input video.mp4 --model subtitle_detector.onnx
 | `--output`        | `<input>.srt`    | Path to the output `.srt` file.                            |
 | `--fps`           | `0`              | Sampling rate; 0 = every frame (frame-accurate timing).    |
 | `--crop-n`        | `0 0.75 1 0.25`  | N-subtitle box `X Y W H` as fractions of the frame.        |
+| `--crop-n2`       | (off)            | Second N-subtitle box `X Y W H`; omit if only one N area.  |
 | `--crop-s`        | (off)            | S-subtitle box `X Y W H`; omit to skip S detection.        |
 | `--model`         | (heuristic)      | Trained `.onnx` presence model.                            |
 | `--threshold`     | `0.5`            | Detection score cutoff (0–1); lower catches more.          |
@@ -157,3 +162,4 @@ model is a separate small `.onnx` file you can swap without rebuilding.
 - [x] Live-scrubbing preview + saved box presets
 - [x] Hue-jitter augmentation so N outline color doesn't affect detection
 - [x] Two-tier glyph mask so weakly saturated outlines still split correctly
+- [x] On/off toggles for the S box and an optional second N box

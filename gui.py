@@ -1,14 +1,16 @@
 """Subtitle Timer — desktop GUI.
 
-Pick a video, place the green box on the N-subtitle area and the orange box
-on the S-subtitle area (scrub to a moment where a subtitle is visible), and
-click Detect — one run covers both styles. Boxes can be dragged/resized on
-the preview or typed in as exact x/y/w/h fractions; their positions are
+Pick a video, place the green box on the N-subtitle area (scrub to a moment
+where a subtitle is visible), and click Detect. A second N box (blue) and
+an S box (orange) are available via checkboxes next to their preset fields
+— check one on for a video with normal subtitles in two places, or off for
+a video with no special style. Boxes can be dragged/resized on the preview
+or typed in as exact x/y/w/h fractions; positions and on/off state are
 saved and restored on the next launch. The app samples frames, classifies
-each box's crop as no / N / S, groups same-label runs into timed blocks
-(S blocks become three ASS-tagged lines), and writes an .srt. Until your
-trained model (.onnx) is selected, a simple edge-density heuristic stands
-in and labels everything it finds as its box's class.
+each active box's crop as no / N / S, groups same-class runs into timed
+blocks (S blocks become three ASS-tagged lines), and writes an .srt. Until
+your trained model (.onnx) is selected, a simple edge-density heuristic
+stands in and labels everything it finds as its box's class.
 
 Run directly:   python gui.py
 Or build an exe: pyinstaller subtitle_extractor.spec
@@ -27,7 +29,12 @@ from types import SimpleNamespace
 
 import cv2
 
-from detector.subtitle_region import DEFAULT_CROP, DEFAULT_CROP_S, clamp_rect
+from detector.subtitle_region import (
+    DEFAULT_CROP,
+    DEFAULT_CROP_N2,
+    DEFAULT_CROP_S,
+    clamp_rect,
+)
 from output.srt_writer import write_srt
 import main as pipeline
 
@@ -41,9 +48,14 @@ if sys.stderr is None:
 
 PREVIEW_MAX_W = 480
 PREVIEW_MAX_H = 270
-# One crop box per subtitle style, each with its own color.
-BOX_COLORS = {"N": "#00e000", "S": "#ff9500"}
-BOX_ORDER = ("N", "S")     # build/draw order; hit-testing prefers the last
+# One crop box per subtitle style/region, each with its own color.
+BOX_COLORS = {"N": "#00e000", "N2": "#2288ff", "S": "#ff9500"}
+BOX_ORDER = ("N", "N2", "S")   # build/draw order; hit-testing prefers the last
+# N2 and S are optional; N is always on (there must be at least one N box).
+# S defaults on to match the app's original behavior; N2 defaults off since
+# it's new and most videos only need one N box.
+TOGGLEABLE_BOXES = ("N2", "S")
+DEFAULT_BOX_ENABLED = {"N2": False, "S": True}
 HANDLE_SIZE = 8        # px, corner squares
 GRAB_RADIUS = 10       # px, how close to a corner counts as grabbing it
 MIN_BOX_PX = 12        # px, minimum box width/height while resizing
@@ -185,8 +197,13 @@ class SubtitleTimerGUI:
         self._preview_cap_path = None     # path the open capture belongs to
         self._scrub_pending = False       # a coalesced scrub redraw is queued
         self._img_size = None             # displayed image (w, h) in px
-        # One (x, y, w, h) fraction rect per style box.
-        self._crops = {"N": list(DEFAULT_CROP), "S": list(DEFAULT_CROP_S)}
+        # One (x, y, w, h) fraction rect per box.
+        self._crops = {
+            "N": list(DEFAULT_CROP),
+            "N2": list(DEFAULT_CROP_N2),
+            "S": list(DEFAULT_CROP_S),
+        }
+        self._box_enabled = dict(DEFAULT_BOX_ENABLED)  # N2/S on/off
         self._drag = None                 # active drag state, see _on_box_press
         self._syncing_entries = False     # guard: drag -> entry sync loops
 
@@ -243,10 +260,11 @@ class SubtitleTimerGUI:
         info.pack(side="left", padx=(0, 8))
         _Tooltip(info, _HELP["model"])
 
-        # Preview with one draggable box per subtitle style
+        # Preview with one draggable box per subtitle style/region
         prev_frame = ttk.LabelFrame(
             self.root,
-            text="Preview — green box = N subtitles, orange box = S subtitles",
+            text="Preview — green box = N, blue box = 2nd N (optional), "
+                 "orange box = S (optional)",
         )
         prev_frame.pack(fill="x", **pad)
 
@@ -270,33 +288,46 @@ class SubtitleTimerGUI:
             command=lambda _v: self._on_scrub(),
         ).pack(side="left", fill="x", expand=True, padx=6)
 
-        # Per-box x/y/w/h preset fields, kept in sync with dragging.
+        # Per-box x/y/w/h preset fields, kept in sync with dragging. N2 and
+        # S also get an on/off checkbox (N is always active).
         preset = ttk.Frame(prev_frame)
         preset.pack(fill="x", padx=6, pady=(2, 6))
         self._crop_vars = {}
+        self._crop_entries = {}
+        self._enabled_vars = {}
         for row, key in enumerate(BOX_ORDER):
+            if key in TOGGLEABLE_BOXES:
+                var = tk.BooleanVar(value=self._box_enabled[key])
+                ttk.Checkbutton(
+                    preset, variable=var,
+                    command=lambda k=key, v=var: self._on_toggle_box(k, v.get()),
+                ).grid(row=row, column=0, sticky="e")
+                self._enabled_vars[key] = var
             tk.Label(
                 preset, text=f"{key} box:", foreground=BOX_COLORS[key],
                 font=("TkDefaultFont", 9, "bold"),
-            ).grid(row=row, column=0, sticky="e", padx=(0, 4), pady=2)
+            ).grid(row=row, column=1, sticky="e", padx=(0, 4), pady=2)
             field_vars = []
+            entries = []
             for col, name in enumerate(("x", "y", "w", "h")):
                 ttk.Label(preset, text=f"{name}=").grid(
-                    row=row, column=1 + col * 2, sticky="e"
+                    row=row, column=2 + col * 2, sticky="e"
                 )
                 var = tk.StringVar()
-                ttk.Entry(preset, textvariable=var, width=7).grid(
-                    row=row, column=2 + col * 2, sticky="w", padx=(0, 8), pady=2
-                )
+                entry = ttk.Entry(preset, textvariable=var, width=7)
+                entry.grid(row=row, column=3 + col * 2, sticky="w", padx=(0, 8), pady=2)
                 var.trace_add("write", lambda *_a, k=key: self._on_crop_entry(k))
                 field_vars.append(var)
+                entries.append(entry)
             self._crop_vars[key] = field_vars
+            self._crop_entries[key] = entries
             self._sync_crop_entries(key)
+            self._update_box_entry_state(key)
         ttk.Label(
             preset,
             text="fractions of the frame (0–1); drag inside a box to move, "
                  "corners to resize — positions are saved for next time",
-        ).grid(row=2, column=0, columnspan=9, sticky="w", pady=(2, 0))
+        ).grid(row=len(BOX_ORDER), column=0, columnspan=10, sticky="w", pady=(2, 0))
 
         # Options
         opt = ttk.LabelFrame(self.root, text="Options")
@@ -458,6 +489,25 @@ class SubtitleTimerGUI:
 
     # ---------- crop boxes ----------
 
+    def _is_box_enabled(self, key):
+        return self._box_enabled.get(key, True)  # "N" isn't in the dict: always on
+
+    def _active_box_order(self):
+        return tuple(key for key in BOX_ORDER if self._is_box_enabled(key))
+
+    def _update_box_entry_state(self, key):
+        """Grey out a toggled-off box's preset fields; N's are never touched."""
+        if key not in self._crop_entries:
+            return
+        state = "normal" if self._is_box_enabled(key) else "disabled"
+        for entry in self._crop_entries[key]:
+            entry.config(state=state)
+
+    def _on_toggle_box(self, key, enabled):
+        self._box_enabled[key] = enabled
+        self._update_box_entry_state(key)
+        self._draw_crop_boxes()
+
     def _box_px(self, key):
         """A style's crop box in canvas pixels: (x0, y0, x1, y1)."""
         iw, ih = self._img_size
@@ -479,7 +529,7 @@ class SubtitleTimerGUI:
         if self._img_size is None:
             return
         r = HANDLE_SIZE / 2
-        for key in BOX_ORDER:
+        for key in self._active_box_order():
             color = BOX_COLORS[key]
             x0, y0, x1, y1 = self._box_px(key)
             self.canvas.create_rectangle(
@@ -524,7 +574,8 @@ class SubtitleTimerGUI:
         """
         if self._img_size is None:
             return None
-        for key in reversed(BOX_ORDER):
+        active = tuple(reversed(self._active_box_order()))
+        for key in active:
             x0, y0, x1, y1 = self._box_px(key)
             corners = {
                 (x0, y0): (x1, y1),
@@ -535,7 +586,7 @@ class SubtitleTimerGUI:
             for (cx, cy), anchor in corners.items():
                 if abs(ex - cx) <= GRAB_RADIUS and abs(ey - cy) <= GRAB_RADIUS:
                     return (key, "corner", anchor)
-        for key in reversed(BOX_ORDER):
+        for key in active:
             x0, y0, x1, y1 = self._box_px(key)
             if x0 <= ex <= x1 and y0 <= ey <= y1:
                 return (key, "inside", None)
@@ -593,7 +644,12 @@ class SubtitleTimerGUI:
     # ---------- saved settings ----------
 
     def _load_config(self):
-        """Restore box presets saved by a previous run."""
+        """Restore box presets and on/off state saved by a previous run.
+
+        A config from before N2/toggles existed has no "*_enabled" keys, so
+        missing keys keep DEFAULT_BOX_ENABLED (S on, matching the app's
+        prior always-on behavior; N2 off, since it's new).
+        """
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -601,15 +657,21 @@ class SubtitleTimerGUI:
                 rect = data.get(f"crop_{key.lower()}")
                 if isinstance(rect, list) and len(rect) == 4:
                     self._crops[key] = list(clamp_rect([float(v) for v in rect]))
+            for key in TOGGLEABLE_BOXES:
+                enabled = data.get(f"{key.lower()}_enabled")
+                if isinstance(enabled, bool):
+                    self._box_enabled[key] = enabled
         except (OSError, ValueError, TypeError):
             pass  # no config yet / unreadable — keep defaults
 
     def _save_config(self):
         try:
+            data = {f"crop_{k.lower()}": self._crops[k] for k in BOX_ORDER}
+            data.update({
+                f"{k.lower()}_enabled": self._box_enabled[k] for k in TOGGLEABLE_BOXES
+            })
             with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
-                json.dump(
-                    {f"crop_{k.lower()}": self._crops[k] for k in BOX_ORDER}, fh
-                )
+                json.dump(data, fh)
         except OSError:
             pass  # non-fatal: presets just won't persist
 
@@ -691,7 +753,8 @@ class SubtitleTimerGUI:
                 output=self.output_var.get().strip() or None,
                 fps=float(self.fps_var.get()),
                 crop_n=tuple(self._crops["N"]),
-                crop_s=tuple(self._crops["S"]),
+                crop_n2=tuple(self._crops["N2"]) if self._is_box_enabled("N2") else None,
+                crop_s=tuple(self._crops["S"]) if self._is_box_enabled("S") else None,
                 model=model_path,
                 threshold=float(self.threshold_var.get()),
                 max_gap=0.3,

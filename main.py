@@ -7,17 +7,20 @@ three classes: "no" (nothing), "N" (normal subtitle -> one timed block), and
 classifier is either a simple built-in heuristic (N only) or a user-trained
 ML model (see TRAINING.md).
 
-Each style has its own crop box: the N box only produces N blocks and the S
-box only S blocks, so one run covers both styles.
+Each style has its own crop box: the N box(es) only produce N blocks and the
+S box only S blocks, so one run covers both styles. A second N box
+(--crop-n2) is optional, for videos that show normal subtitles in two
+different places.
 
 Pipeline:
-    sample frames -> crop each style's box -> classify no/N/S per crop
-    -> group same-label runs into blocks -> expand S blocks -> write .srt
+    sample frames -> crop each region's box -> classify no/N/S per crop
+    -> group same-class runs into blocks -> expand S blocks -> write .srt
 
 Usage:
     python main.py --input video.mp4
     python main.py --input video.mp4 --crop-n 0.1 0.8 0.8 0.15 --fps 5
     python main.py --input video.mp4 --crop-n 0 0.75 1 0.25 --crop-s 0 0.55 1 0.2
+    python main.py --input video.mp4 --crop-n 0 0.75 1 0.25 --crop-n2 0 0.02 1 0.15
     python main.py --input video.mp4 --model subtitle_detector.onnx
 """
 
@@ -78,6 +81,16 @@ def parse_args(argv=None):
         default=list(DEFAULT_CROP),
         help="N-subtitle box as fractions of the frame (default: 0 0.75 1 "
              "0.25, the full-width bottom quarter).",
+    )
+    parser.add_argument(
+        "--crop-n2",
+        dest="crop_n2",
+        type=float,
+        nargs=4,
+        metavar=("X", "Y", "W", "H"),
+        default=None,
+        help="Second N-subtitle box, for videos with normal subtitles in "
+             "two places (default: no second N box).",
     )
     parser.add_argument(
         "--crop-s",
@@ -141,12 +154,14 @@ def default_output_path(input_path):
 def run_detection(args, should_cancel=None):
     """Run per-frame classification and return a list of SubtitleBlock.
 
-    Each style has its own crop box (args.crop_n / args.crop_s; crop_s may
-    be None to skip S). Per sampled frame, each box's crop is classified
-    independently. A detector that can tell N from S (the trained model)
-    only accepts its box's own class — so an N subtitle bleeding into an
-    overlapping S box isn't counted twice; the heuristic can't tell styles
-    apart, so any positive counts as the box's class.
+    Each crop box is a (region_id, crop_rect, target_class) triple: region_id
+    is just a label for logging/bookkeeping (e.g. "N2"), while target_class
+    is the class name the box's detections become ("N" or "S"). This split
+    matters because two boxes can target the same class (a second N box) —
+    a detector that tells classes apart (the trained model) only accepts a
+    box's target_class, never its region_id, so "N2" isn't a class the model
+    needs to know about. The heuristic can't tell styles apart at all, so
+    any positive counts as the box's target_class regardless.
 
     N runs become one placeholder block each; S runs are expanded into three
     ASS-tagged lines with identical timing (utils/grouping.S_LINE_TAGS).
@@ -159,22 +174,27 @@ def run_detection(args, should_cancel=None):
     rate = "every frame" if args.fps <= 0 else f"{args.fps} fps"
     print(f"Detector: {engine} (threshold={args.threshold})")
 
-    regions = [("N", tuple(args.crop_n))]
+    regions = [("N", tuple(args.crop_n), "N")]
+    if getattr(args, "crop_n2", None) is not None:
+        regions.append(("N2", tuple(args.crop_n2), "N"))
     if getattr(args, "crop_s", None) is not None:
-        regions.append(("S", tuple(args.crop_s)))
-    for region_label, crop in regions:
-        print(f"  {region_label} box: {crop}")
+        regions.append(("S", tuple(args.crop_s), "S"))
+    for region_id, crop, _target in regions:
+        print(f"  {region_id} box: {crop}")
     print(f"Sampling {args.input} at {rate}...")
 
-    # Text-change splitting applies to the N box only: the S banner is
-    # bright with dark text, which the glyph mask can't track.
-    splitter = (
-        TextChangeSplitter(iou_threshold=args.split_iou)
-        if args.split_iou > 0 else None
-    )
+    # Text-change splitting applies to N boxes only: the S banner is bright
+    # with dark text, which the glyph mask can't track. Each N-class box
+    # gets its own splitter instance — they watch unrelated screen areas,
+    # so one box's glyph mask must never be compared against another's.
+    splitters = {
+        region_id: TextChangeSplitter(iou_threshold=args.split_iou)
+        for region_id, _crop, target in regions
+        if target == "N" and args.split_iou > 0
+    }
 
-    detections = {region_label: [] for region_label, _ in regions}
-    visible = {region_label: False for region_label, _ in regions}
+    detections = {region_id: [] for region_id, _crop, _target in regions}
+    visible = {region_id: False for region_id, _crop, _target in regions}
     # The real sampling interval is measured from the first two timestamps
     # (fps=0 means native rate, which only the video itself knows).
     first_ts = second_ts = None
@@ -184,28 +204,29 @@ def run_detection(args, should_cancel=None):
             first_ts = timestamp
         elif second_ts is None:
             second_ts = timestamp
-        for region_label, crop in regions:
+        for region_id, crop, target in regions:
             cropped = crop_rect(frame, crop)
             label, _confidence = detector.classify(cropped)
             hit = label != "no" and (
-                label == region_label or not detector.distinguishes_styles
+                label == target or not detector.distinguishes_styles
             )
 
             is_new = False
             if hit:
-                if region_label == "N" and splitter is not None:
+                splitter = splitters.get(region_id)
+                if splitter is not None:
                     # The splitter keeps its memory across "no" flickers so
                     # a text change can't hide inside a gap that grouping
                     # later bridges.
                     is_new = splitter.update(cropped)
-                detections[region_label].append((timestamp, region_label, is_new))
+                detections[region_id].append((timestamp, target, is_new))
 
-            if hit != visible[region_label]:
-                visible[region_label] = hit
+            if hit != visible[region_id]:
+                visible[region_id] = hit
                 state = "appeared" if hit else "gone"
-                print(f"  [{timestamp:7.2f}s] {region_label} subtitle {state}")
+                print(f"  [{timestamp:7.2f}s] {region_id} subtitle {state}")
             elif is_new:
-                print(f"  [{timestamp:7.2f}s] {region_label} subtitle changed")
+                print(f"  [{timestamp:7.2f}s] {region_id} subtitle changed")
 
     effective_fps = args.fps
     if second_ts is not None and second_ts > first_ts:
@@ -213,12 +234,12 @@ def run_detection(args, should_cancel=None):
 
     total = sum(len(hits) for hits in detections.values())
     print(f"{total} positive frames. Grouping into blocks...")
-    # Group each box's stream separately (N and S can be on screen at the
+    # Group each box's stream separately (two boxes can be on screen at the
     # same time), then interleave the blocks by start time.
     blocks = []
-    for region_label, _ in regions:
+    for region_id, _crop, _target in regions:
         blocks.extend(group_detections(
-            detections[region_label],
+            detections[region_id],
             fps=effective_fps,
             max_gap=args.max_gap,
             min_duration=args.min_duration,
