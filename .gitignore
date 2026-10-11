@@ -19,6 +19,7 @@ build.log
 
 # Generated subtitle output
 *.srt
+*.ass
 
 # Training data (dumped frames sorted into yes/no)
 dataset/
