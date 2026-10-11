@@ -1,9 +1,10 @@
 """Subtitle Timer — CLI entry point.
 
-Detect WHEN burned-in subtitles are on screen and write a timed .srt with
-placeholder text. There is no text recognition. Frames are classified into
+Detect WHEN burned-in subtitles are on screen and write a timed .ass (or
+.srt) with placeholder text. There is no text recognition. Frames are classified into
 three classes: "no" (nothing), "N" (normal subtitle -> one timed block), and
-"S" (special style -> three ASS-tagged lines with identical timing). The
+"S" (special style -> several ASS-tagged lines, three by default, with
+identical timing). The
 classifier is either a simple built-in heuristic (N only) or a user-trained
 ML model (see TRAINING.md).
 
@@ -14,7 +15,7 @@ different places.
 
 Pipeline:
     sample frames -> crop each region's box -> classify no/N/S per crop
-    -> group same-class runs into blocks -> expand S blocks -> write .srt
+    -> group same-class runs into blocks -> expand S blocks -> write .ass
 
 Usage:
     python main.py --input video.mp4
@@ -28,17 +29,21 @@ import argparse
 import os
 import sys
 
-from detector.frame_sampler import sample_frames
+from detector.frame_sampler import sample_frames, video_size
 from detector.subtitle_region import DEFAULT_CROP, crop_rect
 from detector.presence import load_detector
 from detector.text_change import TextChangeSplitter
 from utils.grouping import (
+    S_LINE_TAGS,
     add_s_delay,
     expand_s_blocks,
     fix_seven_boundaries,
     fix_seven_ends,
     group_detections,
+    line_problem,
+    s_tags_problem,
 )
+from output.ass_writer import write_ass
 from output.srt_writer import write_srt
 
 
@@ -54,7 +59,8 @@ def _check_cancel(should_cancel):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="subtitle-timer",
-        description="Detect burned-in subtitle timing and write an .srt file.",
+        description="Detect burned-in subtitle timing and write an .ass "
+                    "(or .srt) file.",
     )
     parser.add_argument(
         "--input",
@@ -64,7 +70,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output",
         default=None,
-        help="Path to the output .srt file (default: same name as the video).",
+        help="Path to the output file: .ass, or .srt for SubRip (default: "
+             "an .ass with the same name as the video).",
     )
     parser.add_argument(
         "--fps",
@@ -134,7 +141,17 @@ def parse_args(argv=None):
         "--text",
         default="...",
         help="Placeholder text written into N blocks (default: '...'). "
-             "S blocks get the fixed ASS tag lines instead.",
+             "S blocks get the --s-tags lines instead.",
+    )
+    parser.add_argument(
+        "--s-tags",
+        dest="s_tags",
+        nargs="+",
+        metavar="LINE",
+        default=list(S_LINE_TAGS),
+        help="The lines every S block expands into, top to bottom — as many "
+             "as needed (default: the three ASS fade + position tags in "
+             "utils/grouping.py).",
     )
     parser.add_argument(
         "--split-iou",
@@ -144,12 +161,53 @@ def parse_args(argv=None):
              "consecutive frames drops below this IoU — separates "
              "back-to-back subtitles with no gap (0 disables; default: 0.5).",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace the output file if it already exists (default: refuse — "
+             "the default <video>.ass is also where Aegisub saves an edited "
+             "script, and overwriting it would lose that work).",
+    )
+    args = parser.parse_args(argv)
+    # Strip like the GUI does, so both front ends write the same lines.
+    args.s_tags = [tag.strip() for tag in args.s_tags]
+    problem = s_tags_problem(args.s_tags)
+    if problem:
+        parser.error(f"--s-tags: {problem}")
+    problem = line_problem(args.text)
+    if problem:
+        parser.error(f"--text {problem}")
+    return args
 
 
 def default_output_path(input_path):
     base, _ = os.path.splitext(input_path)
-    return base + ".srt"
+    return base + ".ass"
+
+
+def resolve_output_path(output, input_path):
+    """The file to write: `output`, with .ass added unless it already ends
+    in .ass or .srt (the only formats written — "Episode.01" or "subs.txt"
+    would otherwise hide an ASS script under an extension Aegisub doesn't
+    recognize), or default_output_path when it's empty."""
+    if not output:
+        return default_output_path(input_path)
+    if os.path.splitext(output)[1].lower() not in (".ass", ".srt"):
+        return output + ".ass"
+    return output
+
+
+def write_output(blocks, output_path, video_path):
+    """Write `blocks` as SubRip if `output_path` ends in .srt, else as ASS.
+
+    ASS is the default because Aegisub merges overlapping lines (the
+    stacked S lines) when it handles an .srt. The ASS script resolution is
+    the video's size (1920x1080 if it can't be read).
+    """
+    if output_path.lower().endswith(".srt"):
+        write_srt(blocks, output_path)
+    else:
+        write_ass(blocks, output_path, resolution=video_size(video_path) or (1920, 1080))
 
 
 def run_detection(args, should_cancel=None):
@@ -164,12 +222,24 @@ def run_detection(args, should_cancel=None):
     needs to know about. The heuristic can't tell styles apart at all, so
     any positive counts as the box's target_class regardless.
 
-    N runs become one placeholder block each; S runs are expanded into three
-    ASS-tagged lines with identical timing (utils/grouping.S_LINE_TAGS).
+    N runs become one placeholder block each; S runs are expanded into one
+    line per S tag, all with identical timing (args.s_tags, defaulting to
+    the three utils/grouping.S_LINE_TAGS).
 
     `should_cancel` is an optional zero-arg callable; when it returns True
     the run aborts with PipelineCancelled (checked once per sampled frame).
     """
+    # Checked before the long frame loop, not after it: the N placeholder
+    # text and the S lines go into the output file once it's done.
+    problem = line_problem(args.text)
+    if problem:
+        raise ValueError(f"Block text {problem}")
+    s_tags = getattr(args, "s_tags", None)
+    if s_tags is None:  # an empty list is a caller bug; let the check reject it
+        s_tags = S_LINE_TAGS
+    problem = s_tags_problem(s_tags)
+    if problem:
+        raise ValueError(problem)
     detector = load_detector(args.model, threshold=args.threshold)
     engine = "trained model" if args.model else "built-in heuristic (all N)"
     rate = "every frame" if args.fps <= 0 else f"{args.fps} fps"
@@ -256,8 +326,8 @@ def run_detection(args, should_cancel=None):
     blocks.sort(key=lambda b: b.start)
     n_s = sum(1 for b in blocks if b.label == "S")
     if n_s:
-        print(f"Expanding {n_s} S block(s) into 3 tagged lines each...")
-    blocks = expand_s_blocks(blocks)
+        print(f"Expanding {n_s} S block(s) into {len(s_tags)} tagged line(s) each...")
+    blocks = expand_s_blocks(blocks, tags=s_tags)
     n_delayed = add_s_delay(blocks)
     if n_delayed:
         print(f"Delayed {n_delayed} S line end(s) by 0.16 s.")
@@ -281,12 +351,17 @@ def main(argv=None):
         print(f"Error: model file not found: {args.model}", file=sys.stderr)
         return 1
 
-    output_path = args.output or default_output_path(args.input)
+    output_path = resolve_output_path(args.output, args.input)
+    if os.path.exists(output_path) and not args.overwrite:
+        print(f"Error: {output_path} already exists (it may be a script you "
+              "edited in Aegisub). Pass --overwrite to replace it, or choose "
+              "another --output.", file=sys.stderr)
+        return 1
 
     blocks = run_detection(args)
 
     print(f"Writing {len(blocks)} subtitle blocks to {output_path}...")
-    write_srt(blocks, output_path)
+    write_output(blocks, output_path, args.input)
 
     print("Done.")
     return 0

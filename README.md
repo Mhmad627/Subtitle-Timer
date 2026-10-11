@@ -1,12 +1,13 @@
 # Subtitle Timer
 
-Detect **when** burned-in subtitles are on screen and write a timed `.srt`
-with placeholder text. You position one or more crop boxes over the
-subtitle area(s) and a classifier labels every sampled frame:
+Detect **when** burned-in subtitles are on screen and write a timed `.ass`
+(or `.srt`) with placeholder text. You position one or more crop boxes over
+the subtitle area(s) and a classifier labels every sampled frame:
 
 - **N** — normal subtitle → one timed block
-- **S** — special stacked style → three lines with identical timing and ASS
-  tags (`{\fad(0,300)\pos(...)}`, positions in `utils/grouping.py`)
+- **S** — special stacked style → several lines with identical timing and
+  ASS tags (three `{\fad(0,300)\pos(...)}` lines by default; the number of
+  lines and their text are editable in the GUI or via `--s-tags`)
 - **no** — nothing → ignored
 
 Runs of same-label frames become blocks ("time it until the sub changes").
@@ -41,8 +42,39 @@ via checkboxes next to their preset rows — turn on the second N box for a
 video with normal subtitles in two different places, or turn off the S box
 for a video with no special style. Click **Detect Subtitles** — one run
 times every active box. The model field fills itself in with the newest
-`.onnx` found next to the app (or in the project folder); leave it blank to
-use the built-in heuristic.
+`.onnx` found next to the app or up to two folders above it (so the exe in
+`dist/SubtitleExtractor/` finds the model in the project folder); if there
+is none, it falls back to the last model you used. Leave it blank to use the
+built-in heuristic (Detect asks first, since the heuristic can't tell N from
+S).
+
+The output is an `.ass` file by default (Aegisub's native format), with the
+video's resolution as the script resolution and one plain `Default` style.
+Choosing a `.srt` name in **Save as...** writes SubRip instead — but Aegisub
+merges overlapping lines (like the stacked S lines) in `.srt` files, so
+`.ass` is recommended. A name with any other extension (or none) gets `.ass`
+added. If the output file already exists, Detect asks before replacing it —
+`<video>.ass` is also where Aegisub saves your edited script. Note the
+default S `\pos` values are 1080p coordinates; adjust the S lines for videos
+of other resolutions.
+
+The **S lines** section sets how many lines each S block expands into (1–10,
+three by default) and the text of each, top to bottom (by default the ASS
+fade + position tags). A newly added line starts as a copy of the one above.
+Lowering the count hides lines without deleting them — raising it again
+brings their text back. Everything is saved for next time. Blank lines and
+line breaks are rejected (they would corrupt the output file); the same
+goes for the Block text.
+
+**Dump Crops...** saves the crop of every sampled frame from each active box
+as a PNG (named `<video>_<box>_<ms>ms.png`) into a folder you pick — the
+first step of training the model, see [TRAINING.md](TRAINING.md). It uses
+the Sample fps field: 0 dumps every frame, 1 one per second. Before writing
+more than 5,000 images it shows the estimated count and asks to confirm (it
+also asks when the video has no frame-count metadata and Sample fps is 0).
+
+**Cancel** stops a run between frames. A run whose work is already done
+when Cancel is pressed still finishes and saves its output.
 
 After timing, two corrections run automatically:
 
@@ -61,6 +93,8 @@ python main.py --input video.mp4 --crop-n 0.1 0.8 0.8 0.15 --fps 5
 python main.py --input video.mp4 --crop-n 0 0.75 1 0.25 --crop-s 0 0.55 1 0.2
 python main.py --input video.mp4 --crop-n 0 0.75 1 0.25 --crop-n2 0 0.02 1 0.15
 python main.py --input video.mp4 --model subtitle_detector.onnx
+python main.py --input video.mp4 --s-tags "{\pos(640,600)}" "{\pos(640,650)}"
+python main.py --input video.mp4 --output video.srt --overwrite
 ```
 
 ### CLI options
@@ -68,7 +102,7 @@ python main.py --input video.mp4 --model subtitle_detector.onnx
 | Flag              | Default          | Description                                                |
 | ----------------- | ---------------- | ---------------------------------------------------------- |
 | `--input`         | (required)       | Path to the input video file.                              |
-| `--output`        | `<input>.srt`    | Path to the output `.srt` file.                            |
+| `--output`        | `<input>.ass`    | Output file: `.ass`, or a `.srt` name for SubRip (other names get `.ass` added). |
 | `--fps`           | `0`              | Sampling rate; 0 = every frame (frame-accurate timing).    |
 | `--crop-n`        | `0 0.75 1 0.25`  | N-subtitle box `X Y W H` as fractions of the frame.        |
 | `--crop-n2`       | (off)            | Second N-subtitle box `X Y W H`; omit if only one N area.  |
@@ -77,8 +111,10 @@ python main.py --input video.mp4 --model subtitle_detector.onnx
 | `--threshold`     | `0.5`            | Detection score cutoff (0–1); lower catches more.          |
 | `--max-gap`       | `0.3`            | Longest silence (s) bridged inside one block.              |
 | `--min-duration`  | `0.25`           | Drop blocks shorter than this (s).                         |
-| `--text`          | `...`            | Placeholder text for N blocks (S blocks get ASS tag lines). |
+| `--text`          | `...`            | Placeholder text for N blocks (S blocks get the `--s-tags` lines). |
+| `--s-tags`        | 3 ASS fade + pos | The S lines, top to bottom — as many as you need.          |
 | `--split-iou`     | `0.5`            | Text-change split sensitivity for back-to-back subs (0 = off). |
+| `--overwrite`     | (off)            | Replace an existing output file (otherwise the run refuses). |
 
 ## How it works
 
@@ -89,8 +125,8 @@ Video file
   → Classify each frame: no / N / S          detector/presence.py
   → Spot text changes (back-to-back subs)    detector/text_change.py
   → Group runs into timed blocks             utils/grouping.py
-  → Expand S blocks into 3 tagged lines      utils/grouping.py
-  → Write .srt                               output/srt_writer.py
+  → Expand S blocks into tagged lines        utils/grouping.py
+  → Write .ass (or .srt)                     output/ass_writer.py, srt_writer.py
 ```
 
 Back-to-back N subtitles (a new sentence replacing the previous one with no
@@ -124,7 +160,7 @@ an S block ends on a class change or a gap.
 ```
 subtitle-timer/
 ├── main.py                       # CLI entry point + pipeline
-├── gui.py                        # Tkinter GUI (movable crop box, cancel, log)
+├── gui.py                        # Tkinter GUI (crop boxes, S lines, dump, log)
 ├── detector/
 │   ├── frame_sampler.py          # Extract frames at N fps
 │   ├── subtitle_region.py        # Fraction-rect crop
@@ -132,9 +168,10 @@ subtitle-timer/
 ├── utils/
 │   └── grouping.py               # Detections → timed SubtitleBlocks
 ├── output/
+│   ├── ass_writer.py             # Assemble + write the .ass (default)
 │   └── srt_writer.py             # Assemble + write the .srt
 ├── training/
-│   ├── dump_frames.py            # Build the dataset from your videos
+│   ├── dump_frames.py            # Build the dataset (also the GUI's Dump Crops)
 │   └── train.py                  # Train tiny CNN + export ONNX
 └── TRAINING.md                   # Step-by-step model training guide
 ```
@@ -155,7 +192,7 @@ model is a separate small `.onnx` file you can swap without rebuilding.
 - [x] Timing pipeline with pluggable classifier (heuristic baseline)
 - [x] GUI: movable/resizable crop box, scrubber, cancel, live log
 - [x] Training kit: dataset dumper + tiny 3-class CNN (no/N/S) + ONNX export
-- [x] S blocks → three ASS-tagged lines with shared timing
+- [x] S blocks → ASS-tagged lines with shared timing
 - [x] Zero-gap boundary splitting (bright-mask IoU between frames)
 - [x] Train the real model on target videos
 - [x] Dual crop boxes (N + S) classified independently in one run
@@ -163,3 +200,5 @@ model is a separate small `.onnx` file you can swap without rebuilding.
 - [x] Hue-jitter augmentation so N outline color doesn't affect detection
 - [x] Two-tier glyph mask so weakly saturated outlines still split correctly
 - [x] On/off toggles for the S box and an optional second N box
+- [x] Editable S lines (text and count); crop dumping from the GUI
+- [x] .ass output by default (Aegisub merges overlapping lines in .srt)

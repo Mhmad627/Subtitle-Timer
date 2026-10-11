@@ -8,9 +8,14 @@ a video with no special style. Boxes can be dragged/resized on the preview
 or typed in as exact x/y/w/h fractions; positions and on/off state are
 saved and restored on the next launch. The app samples frames, classifies
 each active box's crop as no / N / S, groups same-class runs into timed
-blocks (S blocks become three ASS-tagged lines), and writes an .srt. Until
-your trained model (.onnx) is selected, a simple edge-density heuristic
-stands in and labels everything it finds as its box's class.
+blocks (S blocks become ASS-tagged lines, three by default), and writes an
+.ass (or an .srt, if the output name ends in .srt). Until your trained model
+(.onnx) is selected, a simple edge-density heuristic stands in and labels
+everything it finds as its box's class (Detect asks before running that way).
+
+The S lines (how many, and each one's text) are editable and saved between
+runs. Dump Crops saves every sampled frame's crop from each active box as a
+PNG — the first step of training the model (see TRAINING.md).
 
 Run directly:   python gui.py
 Or build an exe: pyinstaller subtitle_extractor.spec
@@ -35,7 +40,9 @@ from detector.subtitle_region import (
     DEFAULT_CROP_S,
     clamp_rect,
 )
-from output.srt_writer import write_srt
+from detector.frame_sampler import estimate_sample_count
+from training.dump_frames import dump_video
+from utils.grouping import S_LINE_TAGS, line_problem, s_tags_problem
 import main as pipeline
 
 # When built as a windowed exe (no console), sys.stdout/sys.stderr are None.
@@ -46,6 +53,7 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
+WINDOW_W, WINDOW_H = 720, 900   # starting size; grows to fit more S lines
 PREVIEW_MAX_W = 480
 PREVIEW_MAX_H = 270
 # One crop box per subtitle style/region, each with its own color.
@@ -64,47 +72,75 @@ MIN_BOX_PX = 12        # px, minimum box width/height while resizing
 # the same place in every video).
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".subtitle_timer.json")
 
-# Last-resort place to look for the trained model: the user keeps it in the
-# project folder even when the exe is run from somewhere else.
-MODEL_HOME = r"C:\Users\hjasi\Desktop\Subtitle Timer"
+# S blocks can expand into this many lines at most (the GUI's spinbox range).
+MAX_S_LINES = 10
+S_LINES_PER_COLUMN = 5   # the S line fields wrap into a second column past this
+# Dump Crops asks for confirmation before writing more images than this.
+DUMP_CONFIRM_OVER = 5000
 
 
-def find_default_model():
-    """Find the trained .onnx automatically so the field starts filled in.
+def _usable_prefix(hidden_tags):
+    """The hidden S lines worth keeping: those before the first unusable
+    one. Raising the count past that point then copies the line above
+    instead of bringing back a blank or broken line."""
+    usable = []
+    for tag in hidden_tags:
+        if line_problem(tag):
+            break
+        usable.append(tag)
+    return usable
 
-    Looks in the app's own directory and up to two parents (the exe lives in
-    dist/SubtitleExtractor/, two levels below the project root where the
-    model is kept), then falls back to MODEL_HOME. Newest model wins if
-    there are several (they get retrained often).
+
+def app_dirs():
+    """The app's own directory and up to two parents, nearest first.
+
+    The exe lives in dist/SubtitleExtractor/, two levels below the project
+    root (where the model and dataset/ are kept); run from source, the
+    project root is the first entry.
     """
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
         base = os.path.dirname(os.path.abspath(__file__))
-    search_dirs = [base, os.path.dirname(base), os.path.dirname(os.path.dirname(base))]
-    search_dirs.append(MODEL_HOME)
-    for directory in search_dirs:
+    return [base, os.path.dirname(base), os.path.dirname(os.path.dirname(base))]
+
+
+def find_default_model():
+    """Find the trained .onnx automatically so the field starts filled in.
+
+    Looks in app_dirs(); newest model wins if there are several (they get
+    retrained often). Returns None if there is none — the GUI then falls
+    back to the last model used (saved in the config).
+    """
+    for directory in app_dirs():
         candidates = glob.glob(os.path.join(directory, "*.onnx"))
         if candidates:
             return max(candidates, key=os.path.getmtime)
     return None
 
 
+def find_default_dump_dir():
+    """The project's dataset/unsorted folder (TRAINING.md sorts from it),
+    found next to the app or up to two levels above it; None if absent."""
+    for directory in app_dirs():
+        candidate = os.path.join(directory, "dataset", "unsorted")
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
 class _QueueWriter:
     """File-like object that forwards writes to a queue (thread -> GUI).
 
-    If constructed with a cancel event, write() raises PipelineCancelled once
-    the event is set, aborting long operations at their next output.
+    Writing never aborts a job: jobs check for Cancel themselves once per
+    frame, so a job that already finished its work is never reported as
+    cancelled just because it printed after Cancel was pressed.
     """
 
-    def __init__(self, q, cancel_event=None):
+    def __init__(self, q):
         self._q = q
-        self._cancel_event = cancel_event
-        self.armed = cancel_event is not None
 
     def write(self, text):
-        if self.armed and self._cancel_event.is_set():
-            raise pipeline.PipelineCancelled()
         if text:
             self._q.put(text)
 
@@ -167,9 +203,22 @@ _HELP = {
     ),
     "text": (
         "Placeholder text written into N blocks. S blocks instead become "
-        "three lines with identical timing and fixed ASS tags "
-        "(fade + stacked positions). Fill real text in later with a "
-        "subtitle editor (e.g. Aegisub)."
+        "the S lines below, with identical timing. Fill real text in "
+        "later with a subtitle editor (e.g. Aegisub)."
+    ),
+    "s_tags": (
+        "The lines every S block expands into, top to bottom, all with "
+        "the same timing. By default three ASS tags (fade + stacked "
+        "positions for a 1080p script). Set how many lines you need, then "
+        "edit each one; a new line starts as a copy of the one above. "
+        "Everything is saved for next time."
+    ),
+    "dump": (
+        "Save the crop of every sampled frame from each active box as a "
+        "PNG, for building the training dataset (see TRAINING.md). Uses "
+        "the Sample fps above: 0 = every frame (thousands of images for a "
+        "short video); 1 = one per second. You pick the folder; then sort "
+        "the images into dataset/no, dataset/N and dataset/S."
     ),
     "model": (
         "Your trained 3-class model (.onnx, see TRAINING.md) that labels "
@@ -183,8 +232,12 @@ class SubtitleTimerGUI:
     def __init__(self, root):
         self.root = root
         root.title("Subtitle Timer")
-        root.geometry("720x800")
-        root.minsize(640, 680)
+        # Never taller than the screen (minus the taskbar), or on a small
+        # laptop screen the buttons and log would be unreachable.
+        self._max_h = root.winfo_screenheight() - 80
+        self._start_h = min(WINDOW_H, self._max_h)
+        root.geometry(f"{WINDOW_W}x{self._start_h}")
+        root.minsize(640, min(780, self._max_h))
 
         self._log_queue = queue.Queue()
         self._worker = None
@@ -204,11 +257,16 @@ class SubtitleTimerGUI:
             "S": list(DEFAULT_CROP_S),
         }
         self._box_enabled = dict(DEFAULT_BOX_ENABLED)  # N2/S on/off
+        self._s_tags = list(S_LINE_TAGS)  # every S line, top to bottom
+        self._s_count = len(S_LINE_TAGS)  # how many of them are used
+        self._dump_dir = None             # last folder crops were dumped to
+        self._last_model = None           # last model used (fallback default)
         self._drag = None                 # active drag state, see _on_box_press
         self._syncing_entries = False     # guard: drag -> entry sync loops
 
         self._load_config()
         self._build_widgets()
+        self._fit_window_height()  # e.g. a saved count of 10 S lines
         self._poll_log_queue()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -230,7 +288,10 @@ class SubtitleTimerGUI:
         )
 
         # Output file row
-        out_frame = ttk.LabelFrame(self.root, text="Output .srt (blank = next to video)")
+        out_frame = ttk.LabelFrame(
+            self.root,
+            text="Output file — .ass, or .srt for SubRip (blank = .ass next to video)",
+        )
         out_frame.pack(fill="x", **pad)
 
         self.output_var = tk.StringVar()
@@ -249,16 +310,17 @@ class SubtitleTimerGUI:
         )
         model_frame.pack(fill="x", **pad)
 
-        self.model_var = tk.StringVar(value=find_default_model() or "")
+        default_model = find_default_model()
+        if default_model is None and self._last_model and os.path.isfile(self._last_model):
+            default_model = self._last_model
+        self.model_var = tk.StringVar(value=default_model or "")
         ttk.Entry(model_frame, textvariable=self.model_var).pack(
             side="left", fill="x", expand=True, padx=6, pady=6
         )
         ttk.Button(model_frame, text="Browse...", command=self._browse_model).pack(
             side="left", padx=6, pady=6
         )
-        info = ttk.Label(model_frame, text="ⓘ", foreground="#1a6fd4", cursor="hand2")
-        info.pack(side="left", padx=(0, 8))
-        _Tooltip(info, _HELP["model"])
+        self._info_icon(model_frame, _HELP["model"]).pack(side="left", padx=(0, 8))
 
         # Preview with one draggable box per subtitle style/region
         prev_frame = ttk.LabelFrame(
@@ -354,11 +416,34 @@ class SubtitleTimerGUI:
         )
         self._add_info(opt, 1, 2, _HELP["text"])
 
-        # Run/Cancel buttons + status
+        # The lines each S block expands into, and how many there are
+        s_frame = ttk.LabelFrame(self.root, text="S lines (top to bottom)")
+        s_frame.pack(fill="x", **pad)
+        s_frame.columnconfigure(1, weight=1)
+        count_row = ttk.Frame(s_frame)
+        count_row.grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=(2, 0))
+        ttk.Label(count_row, text="Number of lines:").pack(side="left")
+        self.s_count_var = tk.StringVar(value=str(self._s_count))
+        ttk.Spinbox(
+            count_row, from_=1, to=MAX_S_LINES, width=4, textvariable=self.s_count_var,
+        ).pack(side="left", padx=6)
+        self._info_icon(count_row, _HELP["s_tags"]).pack(side="left")
+        self._s_frame = s_frame
+        # One var per line ever shown; lines hidden by lowering the count
+        # keep their text, so raising it again brings them back.
+        self.s_tag_vars = [tk.StringVar(value=tag) for tag in self._s_tags]
+        self._s_line_widgets = []
+        self._update_s_lines()
+        self.s_count_var.trace_add("write", lambda *_: self._update_s_lines())
+
+        # Run/Dump/Cancel buttons + status
         run_frame = ttk.Frame(self.root)
         run_frame.pack(fill="x", **pad)
         self.run_btn = ttk.Button(run_frame, text="Detect Subtitles", command=self._on_run)
         self.run_btn.pack(side="left", padx=6)
+        self.dump_btn = ttk.Button(run_frame, text="Dump Crops...", command=self._on_dump)
+        self.dump_btn.pack(side="left", padx=6)
+        self._info_icon(run_frame, _HELP["dump"]).pack(side="left", padx=(0, 6))
         self.cancel_btn = ttk.Button(
             run_frame, text="Cancel", command=self._on_cancel, state="disabled"
         )
@@ -377,10 +462,69 @@ class SubtitleTimerGUI:
 
         self.input_var.trace_add("write", lambda *_: self._schedule_preview_load())
 
-    def _add_info(self, parent, row, column, text):
+    def _s_line_count(self):
+        """The spinbox's line count, or None while it isn't a valid 1..MAX."""
+        try:
+            count = int(self.s_count_var.get())
+        except ValueError:
+            return None
+        return count if 1 <= count <= MAX_S_LINES else None
+
+    def _active_s_tags(self):
+        """The S lines currently shown, stripped (None if the count is invalid)."""
+        count = self._s_line_count()
+        if count is None:
+            return None
+        return [var.get().strip() for var in self.s_tag_vars[:count]]
+
+    def _update_s_lines(self):
+        """Show one entry per S line; a never-seen new line copies the one above."""
+        count = self._s_line_count()
+        if count is None:
+            return  # mid-typing in the spinbox
+        while len(self.s_tag_vars) < count:
+            self.s_tag_vars.append(tk.StringVar(value=self.s_tag_vars[-1].get()))
+        for widget in self._s_line_widgets:
+            widget.destroy()
+        self._s_line_widgets = []
+        # Past S_LINES_PER_COLUMN lines, continue in a second column (lines
+        # 1-5 left, 6-10 right) so the section stays short enough for the
+        # log to keep its space on a 1080p screen.
+        self._s_frame.columnconfigure(3, weight=1 if count > S_LINES_PER_COLUMN else 0)
+        for index, var in enumerate(self.s_tag_vars[:count]):
+            row = index % S_LINES_PER_COLUMN + 1
+            col = index // S_LINES_PER_COLUMN * 2
+            label = ttk.Label(self._s_frame, text=f"Line {index + 1}:")
+            label.grid(row=row, column=col, sticky="e", padx=6, pady=2)
+            entry = ttk.Entry(self._s_frame, textvariable=var)
+            entry.grid(row=row, column=col + 1, sticky="ew", padx=6, pady=2)
+            self._s_line_widgets += [label, entry]
+        self._fit_window_height()
+
+    def _fit_window_height(self):
+        """Grow the window when its content (e.g. more S lines) no longer
+        fits, so the log isn't squeezed out; capped at the screen height."""
+        self.root.update_idletasks()
+        needed = self.root.winfo_reqheight()
+        if self.root.winfo_ismapped():
+            if self.root.state() == "zoomed":
+                return  # maximized: resizing would un-maximize it
+            width, current = self.root.winfo_width(), self.root.winfo_height()
+        else:  # startup, before the window is shown: the size set in __init__
+            width, current = WINDOW_W, self._start_h
+        if current < needed:
+            self.root.geometry(f"{width}x{min(needed, self._max_h)}")
+
+    def _info_icon(self, parent, text):
+        """An ⓘ label showing `text` as a tooltip; the caller places it."""
         label = ttk.Label(parent, text="ⓘ", foreground="#1a6fd4", cursor="hand2")
-        label.grid(row=row, column=column, sticky="w", padx=(0, 10))
         _Tooltip(label, text)
+        return label
+
+    def _add_info(self, parent, row, column, text):
+        self._info_icon(parent, text).grid(
+            row=row, column=column, sticky="w", padx=(0, 10)
+        )
 
     # ---------- preview ----------
 
@@ -661,6 +805,21 @@ class SubtitleTimerGUI:
                 enabled = data.get(f"{key.lower()}_enabled")
                 if isinstance(enabled, bool):
                     self._box_enabled[key] = enabled
+            # s_tags holds every line, hidden ones included; s_line_count
+            # says how many are shown (absent in older configs: all of them).
+            tags = data.get("s_tags")
+            if (isinstance(tags, list) and 1 <= len(tags) <= MAX_S_LINES
+                    and all(isinstance(t, str) for t in tags)):
+                count = data.get("s_line_count")
+                if not (type(count) is int and 1 <= count <= len(tags)):  # not bool
+                    count = len(tags)
+                if s_tags_problem(tags[:count]) is None:
+                    self._s_tags = tags[:count] + _usable_prefix(tags[count:])
+                    self._s_count = count
+            if isinstance(data.get("dump_dir"), str):
+                self._dump_dir = data["dump_dir"]
+            if isinstance(data.get("last_model"), str):
+                self._last_model = data["last_model"]
         except (OSError, ValueError, TypeError):
             pass  # no config yet / unreadable — keep defaults
 
@@ -670,6 +829,26 @@ class SubtitleTimerGUI:
             data.update({
                 f"{k.lower()}_enabled": self._box_enabled[k] for k in TOGGLEABLE_BOXES
             })
+            # A half-edited set (a bad shown line or count) would be refused
+            # by Detect; keep the last complete set instead. Hidden lines are
+            # saved too, so raising the count after a restart still brings
+            # them back — up to the first unusable one, so that raising the
+            # count past it copies the line above instead of restoring a
+            # blank line.
+            tags = self._active_s_tags()
+            if tags is not None and s_tags_problem(tags) is None:
+                hidden = [var.get().strip() for var in self.s_tag_vars[len(tags):]]
+                self._s_tags = tags + _usable_prefix(hidden)
+                self._s_count = self._s_line_count()
+            data["s_tags"] = self._s_tags
+            data["s_line_count"] = self._s_count
+            if self._dump_dir:
+                data["dump_dir"] = self._dump_dir
+            model = self.model_var.get().strip()
+            if model and os.path.isfile(model):
+                self._last_model = model
+            if self._last_model:
+                data["last_model"] = self._last_model
             with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
                 json.dump(data, fh)
         except OSError:
@@ -695,9 +874,13 @@ class SubtitleTimerGUI:
 
     def _browse_output(self):
         path = filedialog.asksaveasfilename(
-            title="Save .srt as",
-            defaultextension=".srt",
-            filetypes=[("SubRip subtitle", "*.srt"), ("All files", "*.*")],
+            title="Save subtitles as",
+            defaultextension=".ass",
+            filetypes=[
+                ("ASS subtitle", "*.ass"),
+                ("SubRip subtitle", "*.srt"),
+                ("All files", "*.*"),
+            ],
         )
         if path:
             self.output_var.set(path)
@@ -731,20 +914,42 @@ class SubtitleTimerGUI:
             pass
         self.root.after(100, self._poll_log_queue)
 
+    def _checked_input_path(self):
+        """The chosen video path, or None (after telling the user why)."""
+        input_path = self.input_var.get().strip()
+        if not input_path:
+            messagebox.showwarning("No file", "Please choose a video file first.")
+            return None
+        if not os.path.isfile(input_path):
+            messagebox.showerror("Not found", f"File not found:\n{input_path}")
+            return None
+        return input_path
+
     def _on_run(self):
         if self._worker and self._worker.is_alive():
             return
 
-        input_path = self.input_var.get().strip()
-        if not input_path:
-            messagebox.showwarning("No file", "Please choose a video file first.")
-            return
-        if not os.path.isfile(input_path):
-            messagebox.showerror("Not found", f"File not found:\n{input_path}")
+        input_path = self._checked_input_path()
+        if input_path is None:
             return
         model_path = self.model_var.get().strip() or None
         if model_path and not os.path.isfile(model_path):
             messagebox.showerror("Not found", f"Model file not found:\n{model_path}")
+            return
+        s_tags = self._active_s_tags()
+        if s_tags is None:
+            messagebox.showerror(
+                "Invalid option", f"Number of S lines must be 1–{MAX_S_LINES}."
+            )
+            return
+        problem = s_tags_problem(s_tags)
+        if problem:
+            messagebox.showerror("Invalid option", f"{problem[0].upper()}{problem[1:]}.")
+            return
+        text = self.text_var.get() or "..."
+        problem = line_problem(text)
+        if problem:
+            messagebox.showerror("Invalid option", f"Block text {problem}.")
             return
 
         try:
@@ -759,20 +964,106 @@ class SubtitleTimerGUI:
                 threshold=float(self.threshold_var.get()),
                 max_gap=0.3,
                 min_duration=0.25,
-                text=self.text_var.get() or "...",
+                text=text,
                 split_iou=0.5,
+                s_tags=s_tags,
             )
         except ValueError as exc:
             messagebox.showerror("Invalid option", f"Check numeric fields:\n{exc}")
             return
 
+        if model_path is None and not messagebox.askyesno(
+            "No model selected",
+            "No trained model (.onnx) is selected, so the built-in heuristic "
+            "will be used. It can't tell N from S: every box labels whatever "
+            "it finds as its own class.\n\nRun anyway?",
+        ):
+            return
+
+        # The default <video>.ass is also where Aegisub saves an edited
+        # script; never replace an existing file without asking.
+        args.output = pipeline.resolve_output_path(args.output, args.input)
+        if os.path.exists(args.output) and not messagebox.askyesno(
+            "Replace file?",
+            f"{args.output}\nalready exists — it may be a script you edited in "
+            "Aegisub. Replace it?",
+        ):
+            return
+
+        self._start_job(
+            lambda cancel_event: self._detect_job(args, cancel_event), "Detection failed"
+        )
+
+    def _on_dump(self):
+        if self._worker and self._worker.is_alive():
+            return
+
+        input_path = self._checked_input_path()
+        if input_path is None:
+            return
+        try:
+            fps = float(self.fps_var.get())
+        except ValueError as exc:
+            messagebox.showerror("Invalid option", f"Check Sample fps:\n{exc}")
+            return
+
+        regions = [(key, tuple(self._crops[key])) for key in self._active_box_order()]
+        frames = estimate_sample_count(input_path, fps)
+        if frames is None:
+            messagebox.showerror(
+                "Not a video", f"Could not open this file as a video:\n{input_path}"
+            )
+            return
+        images = frames * len(regions)
+        if frames == 0 and fps <= 0:  # no frame-count metadata (.mkv/.webm)
+            warning = (
+                "Couldn't tell how many frames this video has, so the number "
+                "of images can't be estimated — with Sample fps 0, every "
+                "frame is saved."
+            )
+        elif images > DUMP_CONFIRM_OVER:
+            warning = (
+                f"This will save about {images:,} images ({frames:,} frames × "
+                f"{len(regions)} box(es))."
+            )
+        else:
+            warning = None
+        if warning and not messagebox.askyesno(
+            "Large dump",
+            f"{warning} Setting Sample fps to e.g. 1 saves one per second "
+            "instead.\n\nContinue?",
+        ):
+            return
+
+        # Start in the last-used folder, else the project's dataset/unsorted
+        # (the folder TRAINING.md sorts from).
+        initial = self._dump_dir
+        if not initial or not os.path.isdir(initial):
+            initial = find_default_dump_dir()
+        out_dir = filedialog.askdirectory(
+            title="Save crops to folder", initialdir=initial, mustexist=False
+        )
+        if not out_dir:
+            return
+        self._dump_dir = out_dir
+
+        self._start_job(
+            lambda cancel_event: self._dump_job(input_path, regions, fps, out_dir, cancel_event),
+            "Crop dump failed",
+        )
+
+    def _start_job(self, work, error_title):
+        """Run `work(cancel_event)` on a background thread (see _run_job);
+        a failure is reported in a dialog titled `error_title`."""
         self._save_config()
         self._cancel_event = threading.Event()
         self.run_btn.config(state="disabled")
+        self.dump_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
         self.status_var.set("Working...")
         self._worker = threading.Thread(
-            target=self._run_pipeline, args=(args, self._cancel_event), daemon=True
+            target=self._run_job, args=(work, error_title, self._cancel_event),
+            daemon=True,
         )
         self._worker.start()
 
@@ -782,45 +1073,73 @@ class SubtitleTimerGUI:
         self.cancel_btn.config(state="disabled")
         self.status_var.set("Cancelling...")
 
-    def _run_pipeline(self, args, cancel_event):
-        """Runs on a background thread. stdout/stderr are redirected into the log."""
+    def _detect_job(self, args, cancel_event):
+        output_path = pipeline.resolve_output_path(args.output, args.input)
+        blocks = pipeline.run_detection(args, should_cancel=cancel_event.is_set)
+        print(f"Writing {len(blocks)} subtitle blocks to {output_path}...")
+        pipeline.write_output(blocks, output_path, args.input)
+        print("Done.\n")
+        count = len(blocks)
+        return (f"Done — {count} blocks written.",
+                f"Wrote {count} subtitle blocks to:\n{output_path}")
+
+    def _dump_job(self, video, regions, fps, out_dir, cancel_event):
+        os.makedirs(out_dir, exist_ok=True)
+        rate = "every frame" if fps <= 0 else f"{fps} fps"
+        boxes = ", ".join(key for key, _rect in regions)
+        print(f"Dumping {boxes} box crops at {rate} to {out_dir}...")
+        # Only a dump that actually stopped early counts as cancelled; Cancel
+        # pressed after the last frame leaves a complete dump.
+        stopped_early = False
+
+        def should_cancel():
+            nonlocal stopped_early
+            stopped_early = cancel_event.is_set()
+            return stopped_early
+
+        count = dump_video(video, regions, fps, out_dir, should_cancel=should_cancel)
+        if stopped_early:
+            raise pipeline.PipelineCancelled()
+        print("Done. Next: sort them into dataset/no, dataset/N and dataset/S, "
+              "then run training/train.py.\n")
+        return (f"Done — {count} crops saved.",
+                f"Saved {count} crops to:\n{out_dir}")
+
+    def _run_job(self, work, error_title, cancel_event):
+        """Runs on a background thread. stdout/stderr are redirected into the log.
+
+        `work(cancel_event)` returns (status line, completion message).
+        """
         old_stdout, old_stderr = sys.stdout, sys.stderr
-        writer = _QueueWriter(self._log_queue, cancel_event)
-        sys.stdout = sys.stderr = writer
+        sys.stdout = sys.stderr = _QueueWriter(self._log_queue)
         try:
-            output_path = args.output or pipeline.default_output_path(args.input)
-            blocks = pipeline.run_detection(args, should_cancel=cancel_event.is_set)
-            print(f"Writing {len(blocks)} subtitle blocks to {output_path}...")
-            write_srt(blocks, output_path)
-            print("Done.\n")
-            self.root.after(0, self._on_success, output_path, len(blocks))
+            status, message = work(cancel_event)
+            self.root.after(0, self._on_success, status, message)
         except pipeline.PipelineCancelled:
-            writer.armed = False  # cancellation done; let the messages through
             print("\nCancelled.\n")
             self.root.after(0, self._on_cancelled)
         except Exception as exc:  # surface any failure in the log + a dialog
-            writer.armed = False
             print(f"\nERROR: {exc}\n")
-            self.root.after(0, self._on_error, str(exc))
+            self.root.after(0, self._on_error, error_title, str(exc))
         finally:
             sys.stdout, sys.stderr = old_stdout, old_stderr
             self.root.after(0, self._finish_run)
 
     def _finish_run(self):
         self.run_btn.config(state="normal")
+        self.dump_btn.config(state="normal")
         self.cancel_btn.config(state="disabled")
 
-    def _on_success(self, output_path, count):
-        self.status_var.set(f"Done — {count} blocks written.")
-        messagebox.showinfo("Finished", f"Wrote {count} subtitle blocks to:\n{output_path}")
+    def _on_success(self, status, message):
+        self.status_var.set(status)
+        messagebox.showinfo("Finished", message)
 
     def _on_cancelled(self):
         self.status_var.set("Cancelled.")
 
-    def _on_error(self, message):
+    def _on_error(self, title, message):
         self.status_var.set("Error.")
-        messagebox.showerror("Detection failed", message)
-
+        messagebox.showerror(title, message)
 
 def main():
     root = tk.Tk()

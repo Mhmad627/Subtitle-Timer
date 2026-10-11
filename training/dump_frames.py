@@ -16,7 +16,10 @@ import os
 import sys
 
 # Make the repo root importable when run as `python training/dump_frames.py`.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Only then: the GUI imports this module as part of the training package and
+# must not have its import path changed.
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cv2
 
@@ -40,6 +43,59 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def dump_video(video, regions, fps, out, should_cancel=None):
+    """Crop every sampled frame of `video` and save each crop as a PNG.
+
+    Args:
+        video: Path to the video file.
+        regions: List of (region_id, rect) pairs. region_id goes into the
+            filename ({stem}_{region_id}_{ms}ms.png) so crops from several
+            boxes don't collide; None keeps the plain {stem}_{ms}ms.png
+            name (the single-box CLI case).
+        fps: Sampling rate; 0 = every native frame.
+        out: Output folder (must exist).
+        should_cancel: Optional zero-arg callable; when it returns True the
+            dump stops early (checked once per sampled frame). Used by the
+            GUI's Cancel button.
+
+    Returns:
+        Number of crops written.
+    """
+    stem = os.path.splitext(os.path.basename(video))[0]
+    count = 0
+    # True while the cursor sits at the end of an unterminated "\r" progress
+    # line; anything else printed must start a new line first, or the next
+    # progress update would overwrite it.
+    on_progress_line = False
+    for frames, (timestamp, frame) in enumerate(sample_frames(video, fps=fps), 1):
+        if should_cancel is not None and should_cancel():
+            break
+        for region_id, rect in regions:
+            crop = crop_rect(frame, rect)
+            tag = f"_{region_id}" if region_id else ""
+            name = f"{stem}{tag}_{int(timestamp * 1000):08d}ms.png"
+            # cv2.imwrite silently fails on non-ASCII filenames on Windows
+            # (Japanese video names!); encode in memory and write with
+            # Python's open(), which handles Unicode paths properly.
+            ok, buffer = cv2.imencode(".png", crop)
+            if not ok:
+                if on_progress_line:
+                    print()
+                    on_progress_line = False
+                print(f"  failed to encode frame at {timestamp:.1f}s")
+                continue
+            with open(os.path.join(out, name), "wb") as f:
+                f.write(buffer.tobytes())
+            count += 1
+        if frames % 100 == 0:
+            print(f"\r  {timestamp:7.1f}s: {count} crops", end="")
+            on_progress_line = True
+    if on_progress_line:
+        print()
+    print(f"{video}: {count} crops")
+    return count
+
+
 def main(argv=None):
     args = parse_args(argv)
     os.makedirs(args.out, exist_ok=True)
@@ -49,23 +105,7 @@ def main(argv=None):
         if not os.path.isfile(video):
             print(f"Skipping (not found): {video}")
             continue
-        stem = os.path.splitext(os.path.basename(video))[0]
-        count = 0
-        for timestamp, frame in sample_frames(video, fps=args.fps):
-            crop = crop_rect(frame, args.crop)
-            name = f"{stem}_{int(timestamp * 1000):08d}ms.png"
-            # cv2.imwrite silently fails on non-ASCII filenames on Windows
-            # (Japanese video names!); encode in memory and write with
-            # Python's open(), which handles Unicode paths properly.
-            ok, buffer = cv2.imencode(".png", crop)
-            if not ok:
-                print(f"  failed to encode frame at {timestamp:.1f}s")
-                continue
-            with open(os.path.join(args.out, name), "wb") as f:
-                f.write(buffer.tobytes())
-            count += 1
-        print(f"{video}: {count} crops")
-        total += count
+        total += dump_video(video, [(None, args.crop)], args.fps, args.out)
 
     print(f"\nDumped {total} images to {args.out}.")
     print("Next: sort them into dataset/no/, dataset/N/ and dataset/S/, "

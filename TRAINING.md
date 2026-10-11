@@ -17,6 +17,10 @@ position); the model can only learn what's visible.
 
 ## 1. Collect crops
 
+Easiest: in the app, position the boxes, set Sample fps, and click
+**Dump Crops...** — it saves crops from every active box into the folder you
+pick (it starts in `dataset/unsorted/`). Or from the command line:
+
 Dump cropped frames from a few of your real videos (use roughly the same box
 position you use in the app):
 
@@ -91,8 +95,10 @@ The model input is the crop resized to 256×64 RGB in [0,1]; output is a
 softmax over (no, N, S). The app takes the argmax, and its threshold option
 turns hesitant N/S calls into "no".
 
-The three S tag lines live in `S_LINE_TAGS` in [utils/grouping.py](utils/grouping.py)
-if you ever need to adjust the positions.
+The S lines — how many there are and each one's text — can be edited in the
+app's **S lines** section (or with `--s-tags`); the defaults live in
+`S_LINE_TAGS` in
+[utils/grouping.py](utils/grouping.py).
 
 ## Back-to-back subtitles
 

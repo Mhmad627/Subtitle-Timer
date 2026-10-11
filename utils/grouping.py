@@ -5,15 +5,16 @@ frames with the same label become one SubtitleBlock (bridging short detector
 flickers, dropping one-off false positives). A label change is a block
 boundary — that's how "time it until the sub changes" works.
 
-S blocks are then expanded: each becomes three lines with identical timing,
-prefixed with fixed ASS override tags (fade + stacked positions).
+S blocks are then expanded: each becomes one line per S tag (three by
+default — ASS override tags for fade + stacked positions; the GUI and
+--s-tags can change them and how many there are), all with identical timing.
 
 Back-to-back subtitles of the same class (no gap — e.g. a speaker's next
 sentence) are separated by the `is_new` flag each detection carries, set by
 detector/text_change.py when the on-screen text visibly changes.
 """
 
-# The three lines every S block expands into, in top-to-bottom order.
+# The default lines every S block expands into, in top-to-bottom order.
 # ASS override tags: 300 ms fade-out + fixed positions for a 1080p script.
 S_LINE_TAGS = (
     r"{\fad(0,300)\pos(538,932)}",
@@ -164,7 +165,7 @@ def add_s_delay(blocks, delay=0.16):
 
     User-observed quirk: the S banner's on-screen end lags the model's
     detected end by ~16 centiseconds. Applied after expand_s_blocks, so it
-    reaches all three tagged lines identically (they share timing).
+    reaches every tagged line identically (they share timing).
 
     Mutates `blocks` in place; returns how many ends were delayed.
     """
@@ -176,12 +177,46 @@ def add_s_delay(blocks, delay=0.16):
     return delayed
 
 
+def line_problem(text):
+    """Why `text` can't be a single subtitle line, or None if it can.
+
+    Returns "is blank" or "contains a line break". Either would end the
+    .srt entry (or the .ass Dialogue line) early and corrupt the file.
+    """
+    if not text.strip():
+        return "is blank"
+    # splitlines() knows every line boundary: newline, carriage return and
+    # the Unicode ones (U+2028, U+0085...) that sneak in with pasted text.
+    if text.splitlines() != [text]:
+        return "contains a line break"
+    return None
+
+
+def s_tags_problem(tags):
+    """Why `tags` can't be used as S lines, or None if they can.
+
+    Front ends call this to reject bad input up front; expand_s_blocks
+    enforces it as the last line of defense.
+    """
+    if not tags:
+        return "at least one S line is needed"
+    for number, tag in enumerate(tags, start=1):
+        problem = line_problem(tag)
+        if problem:
+            return f"S line {number} {problem}"
+    return None
+
+
 def expand_s_blocks(blocks, tags=S_LINE_TAGS):
     """Replace each S block with len(tags) lines sharing its timing.
 
     N blocks pass through untouched; each S block becomes one line per ASS
-    tag, in order, all with the original start/end times.
+    tag, in order, all with the original start/end times. Raises ValueError
+    for tags that would corrupt the .srt (see s_tags_problem).
     """
+    problem = s_tags_problem(tags)
+    if problem:
+        raise ValueError(problem)
     out = []
     for block in blocks:
         if block.label == "S":
